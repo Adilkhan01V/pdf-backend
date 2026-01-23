@@ -3,7 +3,6 @@ import os
 import subprocess
 import tempfile
 import shutil
-import platform
 from typing import List, Union, Optional
 import pypdf
 import pikepdf

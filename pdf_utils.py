@@ -240,13 +240,20 @@ def compress_pdf(pdf_file: bytes, target_size_mb: Optional[float] = None) -> byt
     # This uses iterative DPI reduction (200 -> 72)
     gs_result = compress_pdf_ghostscript(current_pdf_bytes, target_size_mb)
     if gs_result is not None:
-        # Check if GS result is actually smaller or meets target
+        # Check if GS result is actually smaller
         gs_size = len(gs_result) / (1024 * 1024)
-        if gs_size <= target_size_mb or gs_size < current_size:
-            return gs_result
-        # If GS didn't help (unlikely but possible), fall through to Pikepdf
+        if gs_size < current_size:
+            # Update current bytes to the GS result
+            current_pdf_bytes = gs_result
+            current_size = gs_size
+            
+            # If GS satisfied the target, we can return early!
+            if target_size_mb is not None and current_size <= target_size_mb:
+                return current_pdf_bytes
         
-    # FALLBACK: Pikepdf Iterative Compression (Downsampling & Quality Reduction)
+    # FALLBACK / CONTINUATION: Pikepdf Iterative Compression (Downsampling & Quality Reduction)
+    # If GS didn't meet the target (or wasn't available), we continue with Pikepdf
+    # using the potentially already-optimized file from GS.
     # List of (scale_factor, jpeg_quality) tuples
     # More granular steps for better precision (to meet target size without over-compressing)
     attempts = [

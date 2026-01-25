@@ -41,23 +41,37 @@ async def merge_pdfs_endpoint(files: List[UploadFile] = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/split")
-async def split_pdf_endpoint(file: UploadFile = File(...)):
+async def split_pdf_endpoint(
+    file: UploadFile = File(...),
+    mode: str = Form("all"), # all, range, selected
+    pages: str = Form(None)  # "2-5" or "1,3,5"
+):
     try:
         content = await file.read()
-        zipped_pages = pdf_utils.split_pdf(content)
         
-        return Response(
-            content=zipped_pages,
-            media_type="application/zip",
-            headers={"Content-Disposition": "attachment; filename=split_pages.zip"}
-        )
+        result = pdf_utils.split_pdf(content, mode, pages)
+        
+        if mode == 'all':
+            return Response(
+                content=result,
+                media_type="application/zip",
+                headers={"Content-Disposition": "attachment; filename=split_pages.zip"}
+            )
+        else:
+             # Range or Selected returns a single PDF
+            return Response(
+                content=result,
+                media_type="application/pdf",
+                headers={"Content-Disposition": "attachment; filename=extracted_pages.pdf"}
+            )
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/compress")
 async def compress_pdf_endpoint(
     file: UploadFile = File(...),
-    target_size_mb: Optional[float] = Form(None)
+    target_size_mb: float = Form(1.0)
 ):
     try:
         content = await file.read()
@@ -69,8 +83,27 @@ async def compress_pdf_endpoint(
             headers={"Content-Disposition": "attachment; filename=compressed.pdf"}
         )
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/img-to-pdf")
+async def img_to_pdf_endpoint(files: List[UploadFile] = File(...)):
+    if not files:
+        raise HTTPException(status_code=400, detail="No images provided")
+    
+    try:
+        image_bytes_list = []
+        for file in files:
+            content = await file.read()
+            image_bytes_list.append(content)
+            
+        pdf_bytes = pdf_utils.images_to_pdf(image_bytes_list)
+        
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=images_converted.pdf"}
+        )
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":

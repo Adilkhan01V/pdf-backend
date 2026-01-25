@@ -98,6 +98,36 @@ def compress_pdf_ghostscript(pdf_bytes: bytes, target_size_mb: float) -> Optiona
         # (This fulfills "Return smallest version with warning metadata" - though we just return bytes here)
         return best_output_bytes
 
+def images_to_pdf(image_bytes_list: List[bytes]) -> bytes:
+    """
+    Convert a list of image bytes to a single PDF.
+    """
+    images = []
+    for img_bytes in image_bytes_list:
+        try:
+            img = Image.open(io.BytesIO(img_bytes))
+            # Convert to RGB to ensure compatibility (e.g. drop alpha channel if needed for PDF)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            images.append(img)
+        except Exception as e:
+            print(f"Error processing image: {e}")
+            continue
+
+    if not images:
+        raise ValueError("No valid images provided")
+
+    output_buffer = io.BytesIO()
+    # Save the first image and append the rest
+    images[0].save(
+        output_buffer, 
+        format='PDF', 
+        save_all=True, 
+        append_images=images[1:]
+    )
+    
+    return output_buffer.getvalue()
+
 def merge_pdfs(pdf_files: List[bytes]) -> bytes:
     """Merge multiple PDF files into one."""
     merger = pypdf.PdfWriter()
@@ -113,30 +143,76 @@ def merge_pdfs(pdf_files: List[bytes]) -> bytes:
     output_stream.seek(0)
     return output_stream.getvalue()
 
-def split_pdf(pdf_file: bytes) -> bytes:
+def split_pdf(pdf_file: bytes, mode: str = "all", pages: Optional[Union[str, List[int]]] = None) -> Union[bytes, tuple]:
     """
-    Split a PDF file. 
-    For simplicity, this splits all pages into separate PDFs and returns a ZIP file.
+    Split a PDF file.
+    Modes:
+    - 'all': Splits all pages into separate PDFs (returns ZIP bytes).
+    - 'range': Extracts a range of pages (e.g., '2-5') into a single PDF (returns PDF bytes).
+    - 'selected': Extracts specific pages (e.g., '1,3,5') into a single PDF (returns PDF bytes).
     """
     input_stream = io.BytesIO(pdf_file)
     reader = pypdf.PdfReader(input_stream)
-    
-    zip_buffer = io.BytesIO()
-    
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        for i, page in enumerate(reader.pages):
-            writer = pypdf.PdfWriter()
-            writer.add_page(page)
-            
-            page_stream = io.BytesIO()
-            writer.write(page_stream)
-            writer.close()
-            
-            page_stream.seek(0)
-            zip_file.writestr(f"page_{i+1}.pdf", page_stream.getvalue())
-            
-    zip_buffer.seek(0)
-    return zip_buffer.getvalue()
+    total_pages = len(reader.pages)
+
+    if mode == 'all':
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            for i, page in enumerate(reader.pages):
+                writer = pypdf.PdfWriter()
+                writer.add_page(page)
+                
+                page_stream = io.BytesIO()
+                writer.write(page_stream)
+                writer.close()
+                
+                page_stream.seek(0)
+                zip_file.writestr(f"page_{i+1}.pdf", page_stream.getvalue())
+        
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
+
+    elif mode in ['range', 'selected']:
+        writer = pypdf.PdfWriter()
+        indices_to_extract = []
+
+        if mode == 'range' and isinstance(pages, str):
+            # Format "start-end" e.g. "2-5"
+            try:
+                start, end = map(int, pages.split('-'))
+                # Adjust for 0-based index
+                start = max(1, start)
+                end = min(total_pages, end)
+                # Create range (inclusive)
+                indices_to_extract = list(range(start - 1, end))
+            except ValueError:
+                pass # Fallback or empty
+
+        elif mode == 'selected' and isinstance(pages, str):
+            # Format "1,3,5"
+            try:
+                parts = pages.split(',')
+                for p in parts:
+                    idx = int(p.strip())
+                    if 1 <= idx <= total_pages:
+                        indices_to_extract.append(idx - 1)
+            except ValueError:
+                pass
+
+        if not indices_to_extract:
+             # Fallback: extract all if invalid
+             indices_to_extract = list(range(total_pages))
+
+        for idx in indices_to_extract:
+            writer.add_page(reader.pages[idx])
+
+        output_stream = io.BytesIO()
+        writer.write(output_stream)
+        writer.close()
+        output_stream.seek(0)
+        return output_stream.getvalue()
+
+    return b""
 
 def _downsample_images(pdf: pikepdf.Pdf, scale_factor: float, quality: int):
     """

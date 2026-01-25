@@ -106,8 +106,8 @@ def images_to_pdf(image_bytes_list: List[bytes]) -> bytes:
     for img_bytes in image_bytes_list:
         try:
             img = Image.open(io.BytesIO(img_bytes))
-            # Convert to RGB to ensure compatibility (e.g. drop alpha channel if needed for PDF)
-            if img.mode != 'RGB':
+            # Convert to RGB to ensure compatibility (e.g. remove alpha channel for PDF)
+            if img.mode == 'RGBA':
                 img = img.convert('RGB')
             images.append(img)
         except Exception as e:

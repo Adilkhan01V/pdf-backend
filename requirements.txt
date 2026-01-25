@@ -3,3 +3,4 @@ uvicorn
 pypdf
 pikepdf
 python-multipart
+Pillow

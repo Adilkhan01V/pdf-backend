@@ -71,7 +71,7 @@ async def split_pdf_endpoint(
 @app.post("/compress")
 async def compress_pdf_endpoint(
     file: UploadFile = File(...),
-    target_size_mb: float = Form(1.0)
+    target_size_mb: Optional[float] = Form(None)
 ):
     try:
         content = await file.read()
@@ -83,12 +83,14 @@ async def compress_pdf_endpoint(
             headers={"Content-Disposition": "attachment; filename=compressed.pdf"}
         )
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/img-to-pdf")
-async def img_to_pdf_endpoint(files: List[UploadFile] = File(...)):
+@app.post("/img2pdf")
+async def img2pdf_endpoint(files: List[UploadFile] = File(...)):
     if not files:
-        raise HTTPException(status_code=400, detail="No images provided")
+        raise HTTPException(status_code=400, detail="No files provided")
     
     try:
         image_bytes_list = []
@@ -101,7 +103,7 @@ async def img_to_pdf_endpoint(files: List[UploadFile] = File(...)):
         return Response(
             content=pdf_bytes,
             media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=images_converted.pdf"}
+            headers={"Content-Disposition": "attachment; filename=converted_images.pdf"}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

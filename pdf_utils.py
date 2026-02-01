@@ -11,6 +11,15 @@ import pytesseract
 import zipfile
 from PIL import Image
 
+# Configure Tesseract Path if not in PATH
+tesseract_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if shutil.which("tesseract") is None:
+    if os.path.exists(tesseract_path):
+        pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        print(f"INFO: Using Tesseract at {tesseract_path}")
+    else:
+        print("WARNING: Tesseract not found in PATH or default location. OCR will fail.")
+
 def get_ghostscript_command() -> Optional[str]:
     """
     Check if Ghostscript is available and return the command name.

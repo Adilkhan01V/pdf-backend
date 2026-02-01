@@ -1,23 +1,26 @@
 # Use an official Python runtime as a parent image
-FROM python:3.9-slim
+FROM python:3.11-slim
 
-# Install Ghostscript (Crucial for PDF Compression)
+# Install system dependencies (Tesseract OCR, Ghostscript, and basic tools)
 RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
     ghostscript \
     && rm -rf /var/lib/apt/lists/*
 
-# Set the working directory
+# Set the working directory in the container
 WORKDIR /app
 
-# Copy the current directory contents into the container at /app
-COPY . /app
+# Copy the requirements file into the container
+COPY requirements.txt .
 
 # Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Make port 8000 available to the world outside this container
+# Copy the rest of the application code
+COPY . .
+
+# Expose the port the app runs on
 EXPOSE 8000
 
-# Run app.py when the container launches
-# Use shell form to allow variable expansion for $PORT (Render sets this dynamically)
-CMD python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Run the application
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

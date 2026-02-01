@@ -4,3 +4,5 @@ pypdf
 pikepdf
 python-multipart
 Pillow
+pytesseract
+pymupdf

@@ -108,6 +108,23 @@ async def img2pdf_endpoint(files: List[UploadFile] = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/extract-text")
+async def extract_text_endpoint(
+    file: UploadFile = File(...),
+    mode: str = Form("ocr") # ocr, text
+):
+    try:
+        content = await file.read()
+        text = pdf_utils.extract_text(content, mode)
+        
+        return Response(
+            content=text,
+            media_type="text/plain",
+            headers={"Content-Disposition": "attachment; filename=extracted_text.txt"}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     # Host 0.0.0.0 is important for Android emulator to access via 10.0.2.2 or local IP

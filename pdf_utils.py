@@ -6,6 +6,8 @@ import shutil
 from typing import List, Union, Optional
 import pypdf
 import pikepdf
+import fitz  # PyMuPDF
+import pytesseract
 import zipfile
 from PIL import Image
 
@@ -401,3 +403,42 @@ def compress_pdf(pdf_file: bytes, target_size_mb: Optional[float] = None) -> byt
             pass
             
     return current_pdf_bytes
+
+def extract_text(pdf_bytes: bytes, mode: str = "ocr") -> str:
+    """
+    Extract text from PDF.
+    mode: 'text' (native extraction) or 'ocr' (optical character recognition).
+    """
+    extracted_text = []
+    
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        for i, page in enumerate(doc):
+            if mode == 'ocr':
+                # Convert page to image (pixmap)
+                # dpi=300 is good for OCR
+                pix = page.get_pixmap(dpi=300)
+                # Convert to PIL Image
+                # fitz pixmap is usually RGB (if not, convert)
+                if pix.n >= 3:
+                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                else:
+                     img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
+                
+                # Perform OCR
+                extracted_text.append(f"--- Page {i+1} ---")
+                text = pytesseract.image_to_string(img)
+                extracted_text.append(text)
+            else:
+                # Native extraction
+                extracted_text.append(f"--- Page {i+1} ---")
+                text = page.get_text()
+                extracted_text.append(text)
+                
+        return "\\n".join(extracted_text)
+        
+    except Exception as e:
+        print(f"Error in extract_text: {e}")
+        return f"Error extracting text: {str(e)}"
+

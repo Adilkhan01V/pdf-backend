@@ -1,3 +1,4 @@
+import json
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -121,7 +122,57 @@ async def split_pdf_endpoint(
 async def compress_pdf_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    target_size_mb: Optional[float] = Form(None)
+    target_size_mb: Optional[float] = Form(None),
+    file_type: str = Form("pdf") # pdf, image
+):
+    input_path = None
+    output_path = None
+    
+    try:
+        # Save input
+        suffix = ".pdf" if file_type == "pdf" else os.path.splitext(file.filename)[1]
+        if not suffix: suffix = ".pdf" # Default fallback
+        
+        fd, input_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Prepare output
+        output_suffix = ".pdf" if file_type == "pdf" else ".jpg"
+        fd, output_path = tempfile.mkstemp(suffix=output_suffix)
+        os.close(fd)
+        
+        # Process
+        if file_type == "image":
+             pdf_utils.compress_image(input_path, output_path, target_size_mb)
+             media_type = "image/jpeg"
+             filename = "compressed_image.jpg"
+        else:
+             pdf_utils.compress_pdf(input_path, output_path, target_size_mb)
+             media_type = "application/pdf"
+             filename = "compressed.pdf"
+        
+        # Cleanup
+        background_tasks.add_task(cleanup_files, [input_path, output_path])
+        
+        return FileResponse(
+            output_path,
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    except Exception as e:
+        if input_path: cleanup_file(input_path)
+        if output_path: cleanup_file(output_path)
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/organize")
+async def organize_pdf_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    pages_config: str = Form(...) # JSON string
 ):
     input_path = None
     output_path = None
@@ -132,13 +183,19 @@ async def compress_pdf_endpoint(
         os.close(fd)
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        
+        # Parse config
+        try:
+            config = json.loads(pages_config)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid pages_config JSON")
             
         # Prepare output
         fd, output_path = tempfile.mkstemp(suffix=".pdf")
         os.close(fd)
         
         # Process
-        pdf_utils.compress_pdf(input_path, output_path, target_size_mb)
+        pdf_utils.organize_pdf(input_path, output_path, config)
         
         # Cleanup
         background_tasks.add_task(cleanup_files, [input_path, output_path])
@@ -146,7 +203,7 @@ async def compress_pdf_endpoint(
         return FileResponse(
             output_path,
             media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=compressed.pdf"}
+            headers={"Content-Disposition": "attachment; filename=organized.pdf"}
         )
     except Exception as e:
         if input_path: cleanup_file(input_path)

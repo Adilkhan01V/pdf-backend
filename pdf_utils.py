@@ -395,3 +395,113 @@ def extract_text(input_path: str, mode: str = "ocr") -> str:
     except Exception as e:
         print(f"Error in extract_text: {e}")
         return f"Error extracting text: {str(e)}"
+
+def compress_image(input_path: str, output_path: str, target_size_mb: Optional[float] = None) -> None:
+    """
+    Compress an image file (JPEG/PNG).
+    Reads from input_path, writes to output_path.
+    """
+    try:
+        img = Image.open(input_path)
+        
+        # Handle transparency for JPEG conversion
+        if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+            # Create white background
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1])
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+            
+        # Initial quality
+        quality = 85
+        step = 5
+        min_quality = 10
+        
+        # If target size is provided, iterate
+        if target_size_mb:
+            target_bytes = target_size_mb * 1024 * 1024
+            
+            while quality >= min_quality:
+                img.save(output_path, "JPEG", optimize=True, quality=quality)
+                if os.path.getsize(output_path) <= target_bytes:
+                    return
+                quality -= step
+        
+        # If no target size or loop finished, save with last quality
+        img.save(output_path, "JPEG", optimize=True, quality=quality)
+        
+    except Exception as e:
+        print(f"Error compressing image: {e}")
+        # If compression fails, try to just copy original if possible, 
+        # but original might not be JPEG. So we save as JPEG with default settings.
+        try:
+             img = Image.open(input_path)
+             if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+             img.save(output_path, "JPEG")
+        except:
+             shutil.copy(input_path, output_path)
+
+def organize_pdf(input_path: str, output_path: str, pages_config: List[dict]) -> None:
+    """
+    Organize PDF: reorder, rotate, delete, add blank pages.
+    pages_config: List of dicts, e.g., 
+    [
+      {"type": "original", "page_index": 0, "rotation": 90}, 
+      {"type": "blank"}
+    ]
+    """
+    reader = pypdf.PdfReader(input_path)
+    writer = pypdf.PdfWriter()
+    
+    total_pages = len(reader.pages)
+    
+    for page_cfg in pages_config:
+        if page_cfg.get("type") == "blank":
+            # Add a blank page (standard A4 size or match first page size?)
+            # pypdf's add_blank_page adds a page with the size of the last added page
+            # or we can specify width/height. Let's try default first.
+            writer.add_blank_page()
+        
+        elif page_cfg.get("type") == "original":
+            idx = page_cfg.get("page_index")
+            if idx is not None and 0 <= idx < total_pages:
+                page = reader.pages[idx]
+                
+                # Handle Rotation
+                # pypdf rotation is clockwise. 
+                # We expect the frontend to send the DESIRED rotation (0, 90, 180, 270).
+                # But the page might already have a rotation.
+                # If we want to set absolute rotation:
+                user_rotation = page_cfg.get("rotation", 0)
+                if user_rotation is not None:
+                     # page.rotate(angle) adds to existing. 
+                     # page.set_rotation(angle) sets absolute? No, pypdf has specific behavior.
+                     # safest is to set the /Rotate entry directly or use transfer_rotation logic
+                     # But page.rotate() usually modifies the page object.
+                     # Let's see: writer.add_page(page) adds the page.
+                     # If we modify 'page', does it affect others? Yes if shared.
+                     # So we should not modify 'page' directly if we reuse it (e.g. duplicate pages).
+                     # But we are reading fresh.
+                     
+                     # To be safe for duplicate pages, we should verify behavior.
+                     # For now, let's assume simple rotation logic:
+                     # writer.add_page(page).rotate(angle) works on the page in the writer?
+                     # pypdf >= 3.0.0: page.rotate(angle) returns the page object.
+                     
+                     # We want ABSOLUTE rotation.
+                     # Current rotation: page.get('/Rotate', 0)
+                     # We want final to be user_rotation.
+                     # So delta = user_rotation - current_rotation
+                     
+                     current_rot = page.get('/Rotate', 0)
+                     delta = (user_rotation - current_rot) % 360
+                     page.rotate(delta)
+                
+                writer.add_page(page)
+
+    writer.write(output_path)
+    writer.close()

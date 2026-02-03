@@ -30,177 +30,150 @@ def get_ghostscript_command() -> Optional[str]:
             return cmd
     return None
 
-def compress_pdf_ghostscript(pdf_bytes: bytes, target_size_mb: float) -> Optional[bytes]:
+def compress_pdf_ghostscript(input_path: str, output_path: str, target_size_mb: float) -> bool:
     """
     Attempt to compress PDF using Ghostscript with iterative DPI reduction.
-    Returns compressed bytes if successful, or None if GS is missing/fails.
+    Returns True if successful, False otherwise.
     """
     gs_cmd = get_ghostscript_command()
     if not gs_cmd:
         print("WARNING: Ghostscript not found. Skipping GS compression.")
-        return None
+        return False
 
     target_bytes = target_size_mb * 1024 * 1024
     
-    # Create temp directory
-    with tempfile.TemporaryDirectory() as temp_dir:
-        input_path = os.path.join(temp_dir, "input.pdf")
-        output_path = os.path.join(temp_dir, "output.pdf")
+    # Iterative compression strategy
+    # Start at 200 DPI, step down by 25, until 72 DPI
+    current_dpi = 200
+    min_dpi = 72
+    step_dpi = 25
+    
+    min_size_achieved = float('inf')
+    # We will use a temp file for intermediate GS outputs to avoid overwriting the final output repeatedly
+    # unless it's the best one. But to keep it simple, we can write to output_path and check size.
+    
+    # However, GS writes directly.
+    
+    while current_dpi >= min_dpi:
+        args = [
+            gs_cmd,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            "-dDownsampleColorImages=true",
+            f"-dColorImageResolution={current_dpi}",
+            "-dDownsampleGrayImages=true",
+            f"-dGrayImageResolution={current_dpi}",
+            "-dDownsampleMonoImages=true",
+            f"-dMonoImageResolution={current_dpi}",
+            f"-sOutputFile={output_path}",
+            input_path
+        ]
         
-        # Write input file
-        with open(input_path, "wb") as f:
-            f.write(pdf_bytes)
+        try:
+            subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-        # Iterative compression strategy
-        # Start at 200 DPI, step down by 25, until 72 DPI
-        current_dpi = 200
-        min_dpi = 72
-        step_dpi = 25
-        
-        best_output_bytes = None
-        min_size_achieved = float('inf')
-        
-        while current_dpi >= min_dpi:
-            # Ghostscript command
-            # We use /default to allow custom resolution overrides
-            args = [
-                gs_cmd,
-                "-sDEVICE=pdfwrite",
-                "-dCompatibilityLevel=1.4",
-                "-dNOPAUSE",
-                "-dQUIET",
-                "-dBATCH",
-                "-dDownsampleColorImages=true",
-                f"-dColorImageResolution={current_dpi}",
-                "-dDownsampleGrayImages=true",
-                f"-dGrayImageResolution={current_dpi}",
-                "-dDownsampleMonoImages=true",
-                f"-dMonoImageResolution={current_dpi}",
-                f"-sOutputFile={output_path}",
-                input_path
-            ]
-            
-            try:
-                subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(output_path):
+                size = os.path.getsize(output_path)
                 
-                if os.path.exists(output_path):
-                    size = os.path.getsize(output_path)
+                # If we met the target, stop!
+                if size <= target_bytes:
+                    return True
                     
-                    with open(output_path, "rb") as f:
-                        output_bytes = f.read()
-                        
-                    # Keep track of the smallest file achieved so far
-                    if size < min_size_achieved:
-                        min_size_achieved = size
-                        best_output_bytes = output_bytes
-                    
-                    # If we met the target, stop!
-                    if size <= target_bytes:
-                        return output_bytes
-                        
-            except subprocess.CalledProcessError:
-                pass
-            except Exception:
-                pass
-                
-            current_dpi -= step_dpi
+        except subprocess.CalledProcessError:
+            pass
+        except Exception:
+            pass
             
-        # If we finished the loop and didn't meet target, return the best we got
-        # (This fulfills "Return smallest version with warning metadata" - though we just return bytes here)
-        return best_output_bytes
+        current_dpi -= step_dpi
+        
+    # If we finished the loop, the last output_path (72 DPI) is there.
+    # It might not meet the target, but it's the best GS could do.
+    return os.path.exists(output_path)
 
-def images_to_pdf(image_bytes_list: List[bytes]) -> bytes:
+def images_to_pdf(image_paths: List[str], output_path: str) -> None:
     """
-    Convert a list of image bytes to a single PDF.
+    Convert a list of images to a single PDF.
     """
     images = []
-    for img_bytes in image_bytes_list:
+    # We load images. For very large images, this might still be memory intensive.
+    # But Pillow handles lazy loading somewhat.
+    # To truly minimize memory for HUGE images, we might need a different approach,
+    # but for typical usage, opening file paths is better than loading bytes.
+    
+    valid_images = []
+    for img_path in image_paths:
         try:
-            img = Image.open(io.BytesIO(img_bytes))
-            # Convert to RGB to ensure compatibility (e.g. remove alpha channel for PDF)
+            img = Image.open(img_path)
+            # Convert to RGB
             if img.mode == 'RGBA':
                 img = img.convert('RGB')
-            images.append(img)
+            valid_images.append(img)
         except Exception as e:
-            print(f"Error processing image: {e}")
+            print(f"Error processing image {img_path}: {e}")
             continue
 
-    if not images:
+    if not valid_images:
         raise ValueError("No valid images provided")
 
-    output_buffer = io.BytesIO()
-    # Save the first image and append the rest
-    images[0].save(
-        output_buffer, 
+    # Save to output path
+    valid_images[0].save(
+        output_path, 
         format='PDF', 
         save_all=True, 
-        append_images=images[1:]
+        append_images=valid_images[1:]
     )
-    
-    return output_buffer.getvalue()
 
-def merge_pdfs(pdf_files: List[bytes]) -> bytes:
+def merge_pdfs(pdf_paths: List[str], output_path: str) -> None:
     """Merge multiple PDF files into one."""
     merger = pypdf.PdfWriter()
     
-    for pdf_bytes in pdf_files:
-        pdf_stream = io.BytesIO(pdf_bytes)
-        merger.append(pdf_stream)
+    for path in pdf_paths:
+        merger.append(path)
         
-    output_stream = io.BytesIO()
-    merger.write(output_stream)
+    merger.write(output_path)
     merger.close()
-    
-    output_stream.seek(0)
-    return output_stream.getvalue()
 
-def split_pdf(pdf_file: bytes, mode: str = "all", pages: Optional[Union[str, List[int]]] = None) -> Union[bytes, tuple]:
+def split_pdf(input_path: str, output_path: str, mode: str = "all", pages: Optional[Union[str, List[int]]] = None) -> str:
     """
     Split a PDF file.
-    Modes:
-    - 'all': Splits all pages into separate PDFs (returns ZIP bytes).
-    - 'range': Extracts a range of pages (e.g., '2-5') into a single PDF (returns PDF bytes).
-    - 'selected': Extracts specific pages (e.g., '1,3,5') into a single PDF (returns PDF bytes).
+    Returns the mimetype of the output (application/zip or application/pdf).
     """
-    input_stream = io.BytesIO(pdf_file)
-    reader = pypdf.PdfReader(input_stream)
+    reader = pypdf.PdfReader(input_path)
     total_pages = len(reader.pages)
 
     if mode == 'all':
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zip_file:
             for i, page in enumerate(reader.pages):
                 writer = pypdf.PdfWriter()
                 writer.add_page(page)
                 
-                page_stream = io.BytesIO()
-                writer.write(page_stream)
-                writer.close()
+                # Write page to a temp file then add to zip to avoid large in-memory buffers
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_page:
+                    writer.write(tmp_page)
+                    tmp_page_path = tmp_page.name
                 
-                page_stream.seek(0)
-                zip_file.writestr(f"page_{i+1}.pdf", page_stream.getvalue())
-        
-        zip_buffer.seek(0)
-        return zip_buffer.getvalue()
+                writer.close()
+                zip_file.write(tmp_page_path, f"page_{i+1}.pdf")
+                os.unlink(tmp_page_path)
+        return "application/zip"
 
     elif mode in ['range', 'selected']:
         writer = pypdf.PdfWriter()
         indices_to_extract = []
 
         if mode == 'range' and isinstance(pages, str):
-            # Format "start-end" e.g. "2-5"
             try:
                 start, end = map(int, pages.split('-'))
-                # Adjust for 0-based index
                 start = max(1, start)
                 end = min(total_pages, end)
-                # Create range (inclusive)
                 indices_to_extract = list(range(start - 1, end))
             except ValueError:
-                pass # Fallback or empty
+                pass
 
         elif mode == 'selected' and isinstance(pages, str):
-            # Format "1,3,5"
             try:
                 parts = pages.split(',')
                 for p in parts:
@@ -211,19 +184,16 @@ def split_pdf(pdf_file: bytes, mode: str = "all", pages: Optional[Union[str, Lis
                 pass
 
         if not indices_to_extract:
-             # Fallback: extract all if invalid
              indices_to_extract = list(range(total_pages))
 
         for idx in indices_to_extract:
             writer.add_page(reader.pages[idx])
 
-        output_stream = io.BytesIO()
-        writer.write(output_stream)
+        writer.write(output_path)
         writer.close()
-        output_stream.seek(0)
-        return output_stream.getvalue()
+        return "application/pdf"
 
-    return b""
+    return "application/pdf"
 
 def _downsample_images(pdf: pikepdf.Pdf, scale_factor: float, quality: int):
     """
@@ -231,35 +201,25 @@ def _downsample_images(pdf: pikepdf.Pdf, scale_factor: float, quality: int):
     """
     count = 0
     for page in pdf.pages:
-        # Access XObject resources directly
         if "/XObject" in page.Resources:
             xobjects = page.Resources.XObject
-            # We need to list keys first because we are modifying the dictionary
             keys = list(xobjects.keys())
             
             for name in keys:
                 raw_image = xobjects[name]
-                # Check if it is an image
                 if raw_image.Subtype != "/Image":
                     continue
                     
                 try:
-                    # Wrap raw object in PdfImage helper
                     pdf_image = pikepdf.PdfImage(raw_image)
-                    
-                    # Convert pikepdf image to PIL
                     pil_image = pdf_image.as_pil_image()
                     
-                    # Calculate new size
                     new_width = int(pil_image.width * scale_factor)
                     new_height = int(pil_image.height * scale_factor)
                     
-                    # Don't resize if too small already
                     if new_width < 10 or new_height < 10:
                         continue
                         
-                    # Resize
-                    # Handle Grayscale vs RGB for JPEG
                     if pil_image.mode == 'L':
                         color_space_name = "/DeviceGray"
                     else:
@@ -268,12 +228,10 @@ def _downsample_images(pdf: pikepdf.Pdf, scale_factor: float, quality: int):
                     
                     resized_pil = pil_image.resize((new_width, new_height), Image.LANCZOS)
                     
-                    # Manual JPEG compression to control quality
                     img_buffer = io.BytesIO()
                     resized_pil.save(img_buffer, format='JPEG', quality=quality)
                     img_buffer.seek(0)
                     
-                    # Create a new pikepdf Stream from raw JPEG data
                     new_stream = pikepdf.Stream(
                         pdf, 
                         img_buffer.getvalue(),
@@ -286,134 +244,127 @@ def _downsample_images(pdf: pikepdf.Pdf, scale_factor: float, quality: int):
                         Filter=pikepdf.Name("/DCTDecode")
                     )
                     
-                    # Replace image in PDF
                     xobjects[name] = new_stream
                     count += 1
                 except Exception:
-                    # If image processing fails, skip it
                     continue
     return count
 
-def compress_pdf(pdf_file: bytes, target_size_mb: Optional[float] = None) -> bytes:
+def compress_pdf(input_path: str, output_path: str, target_size_mb: Optional[float] = None) -> None:
     """
     Compress a PDF file.
-    If target_size_mb is provided, it attempts to reduce file size below that target
-    by iteratively downsampling images and reducing quality.
+    Reads from input_path, writes to output_path.
     """
-    # Helper to get size in MB
-    get_mb = lambda b: len(b) / (1024 * 1024)
+    get_mb = lambda p: os.path.getsize(p) / (1024 * 1024)
     
-    current_pdf_bytes = pdf_file
-    original_size = get_mb(current_pdf_bytes)
+    original_size = get_mb(input_path)
     
-    # 1. Initial Structural Compression
-    input_stream = io.BytesIO(current_pdf_bytes)
-    pdf = pikepdf.Pdf.open(input_stream)
-    pdf.remove_unreferenced_resources()
-    
-    output_stream = io.BytesIO()
-    # Enable object stream generation for better compression of PDF structure
-    pdf.save(output_stream, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
-    pdf.close()
-    
-    current_pdf_bytes = output_stream.getvalue()
-    current_size = get_mb(current_pdf_bytes)
-    
-    # If no target provided, or already satisfied, return
-    if target_size_mb is None or current_size <= target_size_mb:
-        return current_pdf_bytes
+    # If target not set, assume we want significant compression, say 50% or generic
+    if target_size_mb is None:
+        target_size_mb = original_size * 0.75 # Default target
 
-    # PRIORITY: Try Ghostscript Compression first (as requested)
-    # This uses iterative DPI reduction (200 -> 72)
-    gs_result = compress_pdf_ghostscript(current_pdf_bytes, target_size_mb)
-    if gs_result is not None:
-        # Check if GS result is actually smaller
-        gs_size = len(gs_result) / (1024 * 1024)
-        if gs_size < current_size:
-            # Update current bytes to the GS result
-            current_pdf_bytes = gs_result
-            current_size = gs_size
+    # 1. Try Ghostscript first
+    # We use a temp file for GS output to not clobber output_path yet
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as gs_tmp:
+        gs_tmp_path = gs_tmp.name
+    
+    gs_success = compress_pdf_ghostscript(input_path, gs_tmp_path, target_size_mb)
+    
+    current_working_path = input_path
+    if gs_success and os.path.exists(gs_tmp_path):
+        gs_size = get_mb(gs_tmp_path)
+        if gs_size < original_size:
+            current_working_path = gs_tmp_path
             
-            # If GS satisfied the target, we can return early!
-            if target_size_mb is not None and current_size <= target_size_mb:
-                return current_pdf_bytes
-        
-    # FALLBACK / CONTINUATION: Pikepdf Iterative Compression (Downsampling & Quality Reduction)
-    # If GS didn't meet the target (or wasn't available), we continue with Pikepdf
-    # using the potentially already-optimized file from GS.
-    # List of (scale_factor, jpeg_quality) tuples
-    # More granular steps for better precision (to meet target size without over-compressing)
+            if gs_size <= target_size_mb:
+                # Success! Move GS result to output
+                shutil.move(gs_tmp_path, output_path)
+                return
+
+    # 2. Pikepdf Iterative
+    # We work on 'current_working_path' (either original or GS result)
+    # We need to save to output_path.
+    
+    # If we are using the original file, we copy it to output_path first to work on it?
+    # Actually pikepdf can open input and save to output.
+    
     attempts = [
-        (1.0, 95),   # Minimal compression
-        (1.0, 90),
-        (1.0, 85),
-        (1.0, 80),   # Standard
-        (1.0, 75),
-        (1.0, 70),
-        (0.9, 70),   # Slight resize
-        (0.85, 70),
-        (0.8, 70),
-        (0.8, 65),
-        (0.8, 60),
-        (0.75, 60),  # Gradual resize
-        (0.7, 60),
-        (0.65, 60),
-        (0.6, 60),   # Moderate reduction
-        (0.55, 55),
-        (0.5, 50),
-        (0.45, 50),
-        (0.4, 50),   # Aggressive reduction
-        (0.35, 45),
-        (0.3, 40),
-        (0.25, 40)   # Very aggressive
+        (1.0, 95), (1.0, 90), (1.0, 85), (1.0, 80), 
+        (1.0, 75), (1.0, 70), (0.9, 70), (0.85, 70),
+        (0.8, 70), (0.8, 65), (0.8, 60), (0.75, 60),
+        (0.7, 60), (0.65, 60), (0.6, 60), (0.55, 55),
+        (0.5, 50), (0.45, 50), (0.4, 50), (0.35, 45),
+        (0.3, 40), (0.25, 40)
     ]
     
-    # Heuristic: Skip high-quality attempts if the file is WAY larger than target
-    # If current size > 2x target, start from index 3 (Q80)
-    # If current size > 5x target, start from index 9 (0.6/60)
+    current_size = get_mb(current_working_path)
     start_index = 0
     ratio = current_size / target_size_mb
-    if ratio > 5.0:
-        start_index = 9
-    elif ratio > 2.0:
-        start_index = 3
-        
+    if ratio > 5.0: start_index = 9
+    elif ratio > 2.0: start_index = 3
+    
+    best_tmp_path = None
+    min_size = current_size
+    
     for i in range(start_index, len(attempts)):
         scale, quality = attempts[i]
         
-        if current_size <= target_size_mb:
-            break
+        # Open the current best candidate
+        # If we have a best_tmp_path, use that as base? 
+        # No, we should always go back to the 'current_working_path' (GS result or Original) 
+        # to avoid degradation unless we want cumulative?
+        # Typically iterative from source is better to control artifacts.
+        
+        try:
+            pdf = pikepdf.Pdf.open(current_working_path)
             
-        # Re-open the current best PDF
-        input_stream = io.BytesIO(current_pdf_bytes)
-        pdf = pikepdf.Pdf.open(input_stream)
-        
-        # Downsample images
-        _downsample_images(pdf, scale, quality)
-        
-        # Save again
-        pdf.remove_unreferenced_resources()
-        output_stream = io.BytesIO()
-        pdf.save(output_stream, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
-        pdf.close()
-        
-        # Check result
-        new_bytes = output_stream.getvalue()
-        new_size = get_mb(new_bytes)
-        
-        # If we made progress, update current
-        if new_size < current_size:
-            current_pdf_bytes = new_bytes
-            current_size = new_size
-        else:
-            # If this attempt didn't help (e.g. file size increased due to re-encoding or didn't drop), 
-            # we might want to continue to the next more aggressive attempt instead of breaking.
-            # Sometimes 1.0/80 increases size if original was highly compressed, but 0.8/70 might decrease it.
+            _downsample_images(pdf, scale, quality)
+            
+            pdf.remove_unreferenced_resources()
+            
+            # Save to a new temp file
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as attempt_tmp:
+                attempt_path = attempt_tmp.name
+                
+            pdf.save(attempt_path, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+            pdf.close()
+            
+            new_size = get_mb(attempt_path)
+            
+            if new_size < min_size:
+                min_size = new_size
+                if best_tmp_path and os.path.exists(best_tmp_path):
+                    os.unlink(best_tmp_path)
+                best_tmp_path = attempt_path
+                
+                if min_size <= target_size_mb:
+                    break
+            else:
+                os.unlink(attempt_path)
+                
+        except Exception:
             pass
-            
-    return current_pdf_bytes
 
-def extract_text(pdf_bytes: bytes, mode: str = "ocr") -> str:
+    # Finalize
+    if best_tmp_path and os.path.exists(best_tmp_path):
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+        shutil.move(best_tmp_path, output_path)
+    elif current_working_path != input_path:
+        # We used GS and it was the best we got
+        shutil.move(current_working_path, output_path)
+    else:
+        # We failed to compress further, just copy original
+        shutil.copy(input_path, output_path)
+        
+    # Cleanup GS temp if it exists and wasn't moved
+    if os.path.exists(gs_tmp_path):
+        try:
+            os.unlink(gs_tmp_path)
+        except:
+            pass
+
+def extract_text(input_path: str, mode: str = "ocr") -> str:
     """
     Extract text from PDF.
     mode: 'text' (native extraction) or 'ocr' (optical character recognition).
@@ -421,33 +372,26 @@ def extract_text(pdf_bytes: bytes, mode: str = "ocr") -> str:
     extracted_text = []
     
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        doc = fitz.open(input_path)
         
         for i, page in enumerate(doc):
             if mode == 'ocr':
-                # Convert page to image (pixmap)
-                # dpi=300 is good for OCR
                 pix = page.get_pixmap(dpi=300)
-                # Convert to PIL Image
-                # fitz pixmap is usually RGB (if not, convert)
                 if pix.n >= 3:
                      img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 else:
                      img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
                 
-                # Perform OCR
                 extracted_text.append(f"--- Page {i+1} ---")
                 text = pytesseract.image_to_string(img)
                 extracted_text.append(text)
             else:
-                # Native extraction
                 extracted_text.append(f"--- Page {i+1} ---")
                 text = page.get_text()
                 extracted_text.append(text)
                 
-        return "\\n".join(extracted_text)
+        return "\n".join(extracted_text)
         
     except Exception as e:
         print(f"Error in extract_text: {e}")
         return f"Error extracting text: {str(e)}"
-

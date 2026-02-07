@@ -1,7 +1,7 @@
 import json
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 from typing import List, Optional
 import shutil
 import os
@@ -102,20 +102,21 @@ async def split_pdf_endpoint(
         # Process
         mime_type = pdf_utils.split_pdf(input_path, output_path, mode, pages)
         
-        # Cleanup
+        # Add cleanup tasks
         background_tasks.add_task(cleanup_files, [input_path, output_path])
         
-        filename = "split_pages.zip" if mode == 'all' else "extracted_pages.pdf"
+        filename = "split_files.zip" if mime_type == "application/zip" else "split.pdf"
         
         return FileResponse(
             output_path,
             media_type=mime_type,
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
-
+        
     except Exception as e:
-        if input_path: cleanup_file(input_path)
-        if output_path: cleanup_file(output_path)
+        cleanup_file(input_path)
+        if output_path:
+            cleanup_file(output_path)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/compress")
@@ -123,37 +124,37 @@ async def compress_pdf_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     target_size_mb: Optional[float] = Form(None),
-    file_type: str = Form("pdf") # pdf, image
+    file_type: str = Form("pdf")
 ):
     input_path = None
     output_path = None
     
     try:
         # Save input
-        suffix = ".pdf" if file_type == "pdf" else os.path.splitext(file.filename)[1]
-        if not suffix: suffix = ".pdf" # Default fallback
+        ext = os.path.splitext(file.filename)[1]
+        if not ext:
+             ext = ".pdf" if file_type == "pdf" else ".jpg"
         
-        fd, input_path = tempfile.mkstemp(suffix=suffix)
+        fd, input_path = tempfile.mkstemp(suffix=ext)
         os.close(fd)
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
         # Prepare output
-        output_suffix = ".pdf" if file_type == "pdf" else ".jpg"
-        fd, output_path = tempfile.mkstemp(suffix=output_suffix)
+        fd, output_path = tempfile.mkstemp(suffix=suffix)
         os.close(fd)
         
         # Process
-        if file_type == "image":
-             pdf_utils.compress_image(input_path, output_path, target_size_mb)
-             media_type = "image/jpeg"
-             filename = "compressed_image.jpg"
+        if file_type == "pdf":
+            pdf_utils.compress_pdf(input_path, output_path, target_size_mb)
+            media_type = "application/pdf"
+            filename = "compressed.pdf"
         else:
-             pdf_utils.compress_pdf(input_path, output_path, target_size_mb)
-             media_type = "application/pdf"
-             filename = "compressed.pdf"
+            pdf_utils.compress_image(input_path, output_path, target_size_mb)
+            media_type = "image/jpeg"
+            filename = "compressed.jpg"
         
-        # Cleanup
+        # Add cleanup tasks
         background_tasks.add_task(cleanup_files, [input_path, output_path])
         
         return FileResponse(
@@ -161,11 +162,97 @@ async def compress_pdf_endpoint(
             media_type=media_type,
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
+        
     except Exception as e:
-        if input_path: cleanup_file(input_path)
-        if output_path: cleanup_file(output_path)
-        import traceback
-        traceback.print_exc()
+        cleanup_file(input_path)
+        if output_path:
+            cleanup_file(output_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/img2pdf")
+async def img_to_pdf_endpoint(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...)
+):
+    temp_files = []
+    output_path = None
+    
+    try:
+        # Save inputs
+        for file in files:
+            # We need to preserve extensions for Pillow to detect format? 
+            # Pillow can usually detect from bytes, but file extension helps.
+            ext = os.path.splitext(file.filename)[1]
+            if not ext: ext = ".jpg"
+            
+            fd, path = tempfile.mkstemp(suffix=ext)
+            os.close(fd)
+            temp_files.append(path)
+            
+            with open(path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+                
+        # Prepare output
+        fd, output_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        
+        # Process
+        pdf_utils.images_to_pdf(temp_files, output_path)
+        
+        # Add cleanup tasks
+        background_tasks.add_task(cleanup_files, temp_files + [output_path])
+        
+        return FileResponse(
+            output_path,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=images.pdf"}
+        )
+        
+    except Exception as e:
+        cleanup_files(temp_files)
+        if output_path:
+            cleanup_file(output_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/extract-text")
+async def extract_text_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    mode: str = Form("ocr")
+):
+    input_path = None
+    output_path = None
+    
+    try:
+        # Save input
+        fd, input_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Process (returns text, not file path, but we want to return a file/blob)
+        text = pdf_utils.extract_text(input_path, mode)
+        
+        # Write text to temp file
+        fd, output_path = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            
+        # Add cleanup tasks
+        background_tasks.add_task(cleanup_files, [input_path, output_path])
+        
+        return FileResponse(
+            output_path,
+            media_type="text/plain",
+            headers={"Content-Disposition": "attachment; filename=extracted.txt"}
+        )
+        
+    except Exception as e:
+        cleanup_file(input_path)
+        if output_path:
+            cleanup_file(output_path)
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/organize")
@@ -178,17 +265,14 @@ async def organize_pdf_endpoint(
     output_path = None
     
     try:
+        # Parse config
+        config = json.loads(pages_config)
+        
         # Save input
         fd, input_path = tempfile.mkstemp(suffix=".pdf")
         os.close(fd)
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        
-        # Parse config
-        try:
-            config = json.loads(pages_config)
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid pages_config JSON")
             
         # Prepare output
         fd, output_path = tempfile.mkstemp(suffix=".pdf")
@@ -197,7 +281,7 @@ async def organize_pdf_endpoint(
         # Process
         pdf_utils.organize_pdf(input_path, output_path, config)
         
-        # Cleanup
+        # Add cleanup tasks
         background_tasks.add_task(cleanup_files, [input_path, output_path])
         
         return FileResponse(
@@ -205,62 +289,21 @@ async def organize_pdf_endpoint(
             media_type="application/pdf",
             headers={"Content-Disposition": "attachment; filename=organized.pdf"}
         )
+        
     except Exception as e:
-        if input_path: cleanup_file(input_path)
-        if output_path: cleanup_file(output_path)
-        import traceback
-        traceback.print_exc()
+        cleanup_file(input_path)
+        if output_path:
+            cleanup_file(output_path)
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/img2pdf")
-async def img2pdf_endpoint(background_tasks: BackgroundTasks, files: List[UploadFile] = File(...)):
-    if not files:
-        raise HTTPException(status_code=400, detail="No files provided")
-    
-    temp_files = []
-    output_path = None
-    
-    try:
-        # Save uploads
-        for file in files:
-            # Determine extension
-            ext = os.path.splitext(file.filename)[1]
-            if not ext: ext = ".jpg"
-            
-            fd, path = tempfile.mkstemp(suffix=ext)
-            os.close(fd)
-            temp_files.append(path)
-            
-            with open(path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-        
-        # Prepare output
-        fd, output_path = tempfile.mkstemp(suffix=".pdf")
-        os.close(fd)
-        
-        # Process
-        pdf_utils.images_to_pdf(temp_files, output_path)
-        
-        # Cleanup
-        background_tasks.add_task(cleanup_files, temp_files + [output_path])
-        
-        return FileResponse(
-            output_path,
-            media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=converted_images.pdf"}
-        )
-    except Exception as e:
-        cleanup_files(temp_files)
-        if output_path: cleanup_file(output_path)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/extract-text")
-async def extract_text_endpoint(
+@app.post("/protect")
+async def protect_pdf_endpoint(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    mode: str = Form("ocr") # ocr, text
+    password: str = Form(...)
 ):
     input_path = None
+    output_path = None
     
     try:
         # Save input
@@ -269,23 +312,24 @@ async def extract_text_endpoint(
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        # Process - extract_text returns a string, so we don't need a file response for the output, 
-        # but we DO need to clean up the input file.
-        text = pdf_utils.extract_text(input_path, mode)
+        # Prepare output
+        fd, output_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
         
-        # Cleanup
-        background_tasks.add_task(cleanup_file, input_path)
+        # Process
+        pdf_utils.lock_pdf(input_path, output_path, password)
         
-        return Response(
-            content=text,
-            media_type="text/plain",
-            headers={"Content-Disposition": "attachment; filename=extracted_text.txt"}
+        # Add cleanup tasks
+        background_tasks.add_task(cleanup_files, [input_path, output_path])
+        
+        return FileResponse(
+            output_path,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=protected.pdf"}
         )
+        
     except Exception as e:
-        if input_path: cleanup_file(input_path)
+        cleanup_file(input_path)
+        if output_path:
+            cleanup_file(output_path)
         raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    # Host 0.0.0.0 is important for Android emulator to access via 10.0.2.2 or local IP
-    uvicorn.run(app, host="0.0.0.0", port=8000)

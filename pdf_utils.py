@@ -474,34 +474,30 @@ def organize_pdf(input_path: str, output_path: str, pages_config: List[dict]) ->
                 # Handle Rotation
                 # pypdf rotation is clockwise. 
                 # We expect the frontend to send the DESIRED rotation (0, 90, 180, 270).
-                # But the page might already have a rotation.
-                # If we want to set absolute rotation:
+                # We apply rotation to the page AFTER adding it to the writer to avoid 
+                # modifying the source page object (which might be reused/duplicated).
+                
+                added_page = writer.add_page(page)
+                
                 user_rotation = page_cfg.get("rotation", 0)
                 if user_rotation is not None:
-                     # page.rotate(angle) adds to existing. 
-                     # page.set_rotation(angle) sets absolute? No, pypdf has specific behavior.
-                     # safest is to set the /Rotate entry directly or use transfer_rotation logic
-                     # But page.rotate() usually modifies the page object.
-                     # Let's see: writer.add_page(page) adds the page.
-                     # If we modify 'page', does it affect others? Yes if shared.
-                     # So we should not modify 'page' directly if we reuse it (e.g. duplicate pages).
-                     # But we are reading fresh.
-                     
-                     # To be safe for duplicate pages, we should verify behavior.
-                     # For now, let's assume simple rotation logic:
-                     # writer.add_page(page).rotate(angle) works on the page in the writer?
-                     # pypdf >= 3.0.0: page.rotate(angle) returns the page object.
-                     
-                     # We want ABSOLUTE rotation.
-                     # Current rotation: page.get('/Rotate', 0)
-                     # We want final to be user_rotation.
-                     # So delta = user_rotation - current_rotation
-                     
-                     current_rot = page.get('/Rotate', 0)
+                     current_rot = added_page.get('/Rotate', 0)
                      delta = (user_rotation - current_rot) % 360
-                     page.rotate(delta)
-                
-                writer.add_page(page)
+                     if delta != 0:
+                        added_page.rotate(delta)
 
     writer.write(output_path)
     writer.close()
+def lock_pdf(input_path: str, output_path: str, password: str) -> None:
+    """
+    Lock PDF: add password protection.
+    """
+    reader = pypdf.PdfReader(input_path)
+    writer = pypdf.PdfWriter()
+    
+    for page in reader.pages:
+        writer.add_page(page)
+    
+    writer.encrypt(password)
+    with open(output_path, 'wb') as f:
+        writer.write(f)

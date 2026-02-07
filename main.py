@@ -7,6 +7,7 @@ import shutil
 import os
 import tempfile
 import pdf_utils
+import watermark_utils
 
 app = FastAPI()
 
@@ -332,4 +333,57 @@ async def protect_pdf_endpoint(
         cleanup_file(input_path)
         if output_path:
             cleanup_file(output_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/pdf/watermark/text")
+async def add_watermark_text_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    text: str = Form(...),
+    fontSize: int = Form(40),
+    opacity: float = Form(0.5),
+    rotation: int = Form(45),
+    isBold: bool = Form(False),
+    isItalic: bool = Form(False),
+    isUnderline: bool = Form(False)
+):
+    input_path = None
+    output_path = None
+    
+    try:
+        # Save input
+        fd, input_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Prepare output
+        fd, output_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        
+        # Process
+        try:
+            watermark_utils.apply_watermark(
+                input_path, output_path,
+                text, fontSize, opacity, rotation, isBold, isItalic, isUnderline
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        
+        # Add cleanup tasks
+        background_tasks.add_task(cleanup_files, [input_path, output_path])
+        
+        return FileResponse(
+            output_path,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=watermarked.pdf"}
+        )
+        
+    except HTTPException:
+        cleanup_file(input_path)
+        if output_path: cleanup_file(output_path)
+        raise
+    except Exception as e:
+        cleanup_file(input_path)
+        if output_path: cleanup_file(output_path)
         raise HTTPException(status_code=500, detail=str(e))

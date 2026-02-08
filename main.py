@@ -2,12 +2,14 @@ import json
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from typing import List, Optional
 import shutil
 import os
 import tempfile
 import pdf_utils
 import watermark_utils
+import ai_utils
 
 app = FastAPI()
 
@@ -386,4 +388,47 @@ async def add_watermark_text_endpoint(
     except Exception as e:
         cleanup_file(input_path)
         if output_path: cleanup_file(output_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- AI Features ---
+
+class AssistantRequest(BaseModel):
+    message: str
+
+@app.post("/ai/assistant")
+async def ai_assistant_endpoint(request: AssistantRequest):
+    """
+    AI Assistant for app guidance.
+    """
+    response = ai_utils.get_assistant_response(request.message)
+    return {"reply": response}
+
+@app.post("/ai/chat-pdf")
+async def chat_with_pdf_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    question: str = Form(...)
+):
+    """
+    Chat with an uploaded PDF.
+    """
+    input_path = None
+    
+    try:
+        # Save input
+        fd, input_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Process
+        answer = ai_utils.chat_with_pdf(input_path, question)
+        
+        # Add cleanup tasks
+        background_tasks.add_task(cleanup_file, input_path)
+        
+        return {"reply": answer}
+        
+    except Exception as e:
+        cleanup_file(input_path)
         raise HTTPException(status_code=500, detail=str(e))

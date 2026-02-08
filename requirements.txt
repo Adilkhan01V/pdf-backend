@@ -6,3 +6,4 @@ python-multipart
 Pillow
 pytesseract
 pymupdf
+google-generativeai

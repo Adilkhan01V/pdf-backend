@@ -1,6 +1,7 @@
 import os
 import google.generativeai as genai
 import fitz  # PyMuPDF
+import pdf_utils
 
 # Configure Gemini
 def configure_genai():
@@ -67,8 +68,19 @@ def chat_with_pdf(pdf_path: str, user_question: str) -> str:
         for page in doc:
             text += page.get_text()
         
+        # If native text is empty or too short, try OCR
+        if not text.strip() or len(text.strip()) < 50:
+            print("INFO: Native text extraction yielded little/no text. Attempting OCR...")
+            try:
+                # Use the existing extract_text utility with OCR mode
+                ocr_text = pdf_utils.extract_text(pdf_path, mode='ocr')
+                if ocr_text.strip():
+                    text = ocr_text
+            except Exception as ocr_error:
+                print(f"WARNING: OCR failed: {ocr_error}")
+
         if not text.strip():
-            return "Error: This PDF seems to be empty or contains only images (no selectable text). I cannot read it yet."
+            return "Error: This PDF seems to be empty or contains only images (no selectable text), and OCR could not extract any text."
             
         # Limit text length for free tier (approx 30k chars is safe for simple context)
         # Gemini 1.5 Flash has a large context window, but let's be safe.

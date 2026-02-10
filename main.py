@@ -144,6 +144,7 @@ async def compress_pdf_endpoint(
             shutil.copyfileobj(file.file, buffer)
             
         # Prepare output
+        suffix = ".pdf" if file_type == "pdf" else ".jpg"
         fd, output_path = tempfile.mkstemp(suffix=suffix)
         os.close(fd)
         

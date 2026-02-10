@@ -198,16 +198,28 @@ def split_pdf(input_path: str, output_path: str, mode: str = "all", pages: Optio
 def _downsample_images(pdf: pikepdf.Pdf, scale_factor: float, quality: int):
     """
     Iterates through all images in the PDF and resizes/compresses them.
+    Handles shared resources to prevent file bloat.
     """
     count = 0
+    seen_images = {} # Map objgen to new stream
+
     for page in pdf.pages:
-        if "/XObject" in page.Resources:
-            xobjects = page.Resources.XObject
+        if "/Resources" not in page:
+            continue
+        resources = page.Resources
+        if "/XObject" in resources:
+            xobjects = resources.XObject
             keys = list(xobjects.keys())
             
             for name in keys:
                 raw_image = xobjects[name]
                 if raw_image.Subtype != "/Image":
+                    continue
+                
+                # Check if we already processed this image (handle shared resources)
+                # raw_image is a pikepdf object. We use its object ID (objgen) as key.
+                if hasattr(raw_image, 'objgen') and raw_image.objgen in seen_images:
+                    xobjects[name] = seen_images[raw_image.objgen]
                     continue
                     
                 try:
@@ -244,6 +256,10 @@ def _downsample_images(pdf: pikepdf.Pdf, scale_factor: float, quality: int):
                         Filter=pikepdf.Name("/DCTDecode")
                     )
                     
+                    # Update cache if it's an indirect object
+                    if hasattr(raw_image, 'objgen'):
+                        seen_images[raw_image.objgen] = new_stream
+
                     xobjects[name] = new_stream
                     count += 1
                 except Exception:
@@ -376,11 +392,9 @@ def extract_text(input_path: str, mode: str = "ocr") -> str:
         
         for i, page in enumerate(doc):
             if mode == 'ocr':
-                pix = page.get_pixmap(dpi=300)
-                if pix.n >= 3:
-                     img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                else:
-                     img = Image.frombytes("L", [pix.width, pix.height], pix.samples)
+                # Force RGB to avoid sample mismatch issues with CMYK/RGBA
+                pix = page.get_pixmap(dpi=300, colorspace=fitz.csRGB)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 
                 extracted_text.append(f"--- Page {i+1} ---")
                 text = pytesseract.image_to_string(img)

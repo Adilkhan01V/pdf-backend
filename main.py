@@ -391,6 +391,50 @@ async def add_watermark_text_endpoint(
         if output_path: cleanup_file(output_path)
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/unlock")
+async def unlock_pdf_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    password: str = Form(...)
+):
+    input_path = None
+    output_path = None
+    
+    try:
+        # Save input
+        fd, input_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Prepare output
+        fd, output_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        
+        # Process
+        try:
+            pdf_utils.unlock_pdf(input_path, output_path, password)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        
+        # Add cleanup tasks
+        background_tasks.add_task(cleanup_files, [input_path, output_path])
+        
+        return FileResponse(
+            output_path,
+            media_type="application/pdf",
+            headers={"Content-Disposition": "attachment; filename=unlocked.pdf"}
+        )
+        
+    except HTTPException:
+        cleanup_file(input_path)
+        if output_path: cleanup_file(output_path)
+        raise
+    except Exception as e:
+        cleanup_file(input_path)
+        if output_path: cleanup_file(output_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --- AI Features ---
 
 class AssistantRequest(BaseModel):

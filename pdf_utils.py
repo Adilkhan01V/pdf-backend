@@ -515,3 +515,29 @@ def lock_pdf(input_path: str, output_path: str, password: str) -> None:
     writer.encrypt(password)
     with open(output_path, 'wb') as f:
         writer.write(f)
+
+def unlock_pdf(input_path: str, output_path: str, password: str) -> None:
+    """
+    Unlock a password-protected PDF.
+    Raises ValueError with a descriptive message on failure.
+    """
+    # First, check if the PDF is actually encrypted
+    try:
+        test_pdf = pikepdf.Pdf.open(input_path)
+        # If we can open without password, it's not encrypted
+        test_pdf.close()
+        raise ValueError("This PDF is not password protected.")
+    except pikepdf.PasswordError:
+        # Good — the PDF is indeed encrypted, proceed to unlock
+        pass
+    except ValueError:
+        # Re-raise our own ValueError
+        raise
+
+    # Now try to open with the provided password
+    try:
+        pdf = pikepdf.Pdf.open(input_path, password=password)
+        pdf.save(output_path)
+        pdf.close()
+    except pikepdf.PasswordError:
+        raise ValueError("Wrong password. Please try again.")

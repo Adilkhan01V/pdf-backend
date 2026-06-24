@@ -477,3 +477,76 @@ async def chat_with_pdf_endpoint(
     except Exception as e:
         cleanup_file(input_path)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ai/summarize")
+async def summarize_pdf_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    """
+    Summarize an uploaded PDF.
+    """
+    input_path = None
+    
+    try:
+        # Save input
+        fd, input_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Process
+        summary = ai_utils.summarize_pdf(input_path)
+        
+        # Add cleanup tasks
+        background_tasks.add_task(cleanup_file, input_path)
+        
+        return {"reply": summary}
+        
+    except Exception as e:
+        cleanup_file(input_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/resize-image")
+async def resize_image_endpoint(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    width: Optional[int] = Form(None),
+    height: Optional[int] = Form(None),
+    scale_factor: Optional[float] = Form(None)
+):
+    input_path = None
+    output_path = None
+    
+    try:
+        # Save input
+        ext = os.path.splitext(file.filename)[1]
+        if not ext: ext = ".jpg"
+        fd, input_path = tempfile.mkstemp(suffix=ext)
+        os.close(fd)
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            
+        # Prepare output
+        fd, output_path = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
+        
+        # Process
+        pdf_utils.resize_image(input_path, output_path, width, height, scale_factor)
+        
+        # Add cleanup tasks
+        background_tasks.add_task(cleanup_files, [input_path, output_path])
+        
+        return FileResponse(
+            output_path,
+            media_type="image/jpeg",
+            headers={"Content-Disposition": "attachment; filename=resized.jpg"}
+        )
+        
+    except Exception as e:
+        cleanup_file(input_path)
+        if output_path:
+            cleanup_file(output_path)
+        raise HTTPException(status_code=500, detail=str(e))

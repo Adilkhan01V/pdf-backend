@@ -456,7 +456,7 @@ def compress_image(input_path: str, output_path: str, target_size_mb: Optional[f
              if img.mode in ('RGBA', 'P'):
                 img = img.convert('RGB')
              img.save(output_path, "JPEG")
-        except:
+        except Exception:
              shutil.copy(input_path, output_path)
 
 def organize_pdf(input_path: str, output_path: str, pages_config: List[dict]) -> None:
@@ -541,3 +541,53 @@ def unlock_pdf(input_path: str, output_path: str, password: str) -> None:
         pdf.close()
     except pikepdf.PasswordError:
         raise ValueError("Wrong password. Please try again.")
+
+
+def resize_image(input_path: str, output_path: str, width: Optional[int] = None, height: Optional[int] = None, scale_factor: Optional[float] = None) -> None:
+    """
+    Resize an image. If scale_factor is provided, use that; else use width/height (preserve aspect ratio if only one is provided).
+    """
+    try:
+        img = Image.open(input_path)
+        
+        if scale_factor:
+            new_width = int(img.width * scale_factor)
+            new_height = int(img.height * scale_factor)
+        else:
+            if width and height:
+                new_width, new_height = width, height
+            elif width:
+                ratio = width / img.width
+                new_height = int(img.height * ratio)
+                new_width = width
+            elif height:
+                ratio = height / img.height
+                new_width = int(img.width * ratio)
+                new_height = height
+            else:
+                shutil.copy(input_path, output_path)
+                return
+        
+        resized_img = img.resize((new_width, new_height), Image.LANCZOS)
+        
+        # Handle transparency for JPEG conversion
+        if resized_img.mode in ('RGBA', 'LA') or (resized_img.mode == 'P' and 'transparency' in resized_img.info):
+            background = Image.new('RGB', resized_img.size, (255, 255, 255))
+            if resized_img.mode == 'P':
+                resized_img = resized_img.convert('RGBA')
+            background.paste(resized_img, mask=resized_img.split()[-1])
+            resized_img = background
+        elif resized_img.mode != 'RGB':
+            resized_img = resized_img.convert('RGB')
+            
+        resized_img.save(output_path, "JPEG", optimize=True)
+        
+    except Exception as e:
+        print(f"Error resizing image: {e}")
+        try:
+             img = Image.open(input_path)
+             if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+             img.save(output_path, "JPEG")
+        except Exception:
+             shutil.copy(input_path, output_path)

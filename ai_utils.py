@@ -3,37 +3,38 @@ import hashlib
 from collections import OrderedDict
 from typing import Optional
 
-import google.generativeai as genai
+from dotenv import load_dotenv
+import google.genai as genai
+from google.genai import types
+
+# Load environment variables from .env file
+load_dotenv(override=True)
 import fitz  # PyMuPDF
 import pdf_utils
 
 _genai_configured = False
-_gemini_model: Optional[genai.GenerativeModel] = None
+_gemini_client: Optional[genai.Client] = None
 _pdf_text_cache: "OrderedDict[str, str]" = OrderedDict()
 _pdf_text_cache_max_entries = 8
 
 
 def configure_genai() -> bool:
-    global _genai_configured
+    global _genai_configured, _gemini_client
     if _genai_configured:
         return True
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         print("WARNING: GEMINI_API_KEY not set.")
         return False
-    genai.configure(api_key=api_key)
+    _gemini_client = genai.Client(api_key=api_key)
     _genai_configured = True
     return True
 
 
-def _get_gemini_model() -> Optional[genai.GenerativeModel]:
-    global _gemini_model
-    if _gemini_model is not None:
-        return _gemini_model
+def _get_gemini_client() -> Optional[genai.Client]:
     if not configure_genai():
         return None
-    _gemini_model = genai.GenerativeModel("gemini-flash-latest")
-    return _gemini_model
+    return _gemini_client
 
 
 def _hash_file(path: str) -> Optional[str]:
@@ -75,41 +76,53 @@ def get_assistant_response(message: str) -> str:
     """
     Get a response from the AI Assistant for app guidance.
     """
-    model = _get_gemini_model()
-    if model is None:
+    client = _get_gemini_client()
+    if client is None:
         return "Error: AI service not configured (Missing API Key)."
 
     try:
-        system_prompt = """
-    You are a helpful AI assistant for the 'GearPDF' application. 
-    Your ONLY goal is to help users understand how to use the PDF tools in this app.
-    
-    The tools available are:
-    1. Merge PDF: Combine multiple PDFs into one.
-    2. Split PDF: Extract pages or split into individual files.
-    3. Compress PDF: Reduce file size.
-    4. Image to PDF: Convert images (JPG/PNG) to PDF.
-    5. Extract Text: Get text from PDF (supports OCR).
-    6. Organize PDF: Reorder, rotate, or delete pages.
-    7. Security: Add password protection.
-    8. Watermark: Add text watermarks.
-    9. Chat with PDF: Upload a PDF and ask questions about it.
+        # Debug log
+        print(f"DEBUG: Generating assistant response for message: {message[:50]}...")
 
-    If the user greets you (Hello, Hi, Namaste), greet them back politely in the same language.
-    If the user asks how to use a tool, explain it simply.
-    If the user asks about anything unrelated to PDF tools (e.g., "Who is the president?", "Write code"), 
-    politely refuse and say you can only help with the PDF app.
-    
-    IMPORTANT: Reply in the SAME language as the user (English, Hindi, or Hinglish).
-    """
+        system_prompt = """You are a helpful AI assistant for the 'GearPDF' application. 
+Your ONLY goal is to help users understand how to use the PDF tools in this app.
 
-        chat = model.start_chat(history=[
-            {"role": "user", "parts": [system_prompt]},
-            {"role": "model", "parts": ["Understood. I will guide users on using GearPDF tools in their preferred language."]}
-        ])
-        response = chat.send_message(message)
+The tools available are:
+1. Merge PDF: Combine multiple PDFs into one.
+2. Split PDF: Extract pages or split into individual files.
+3. Compress PDF: Reduce file size.
+4. Image to PDF: Convert images (JPG/PNG) to PDF.
+5. Extract Text: Get text from PDF (supports OCR).
+6. Organize PDF: Reorder, rotate, or delete pages.
+7. Security: Add password protection.
+8. Watermark: Add text watermarks.
+9. Chat with PDF: Upload a PDF and ask questions about it.
+
+If the user greets you (Hello, Hi, Namaste), greet them back politely in the same language.
+If the user asks how to use a tool, explain it simply.
+If the user asks about anything unrelated to PDF tools (e.g., "Who is the president?", "Write code"), 
+politely refuse and say you can only help with the PDF app.
+
+IMPORTANT: Reply in the SAME language as the user (English, Hindi, or Hinglish)."""
+
+        full_prompt = f"{system_prompt}\n\nUSER: {message}"
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=full_prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=500,
+                temperature=0.7
+            )
+        )
+        
+        if not response or not response.text:
+             print("DEBUG: AI returned empty response for assistant")
+             return "Error: AI returned an empty response."
+             
+        print(f"DEBUG: Assistant response generated successfully. Length: {len(response.text)}")
         return response.text
     except Exception as e:
+        print(f"DEBUG: AI Error in get_assistant_response: {str(e)}")
         return f"AI Error: {str(e)}"
 
 
@@ -117,8 +130,8 @@ def chat_with_pdf(pdf_path: str, user_question: str) -> str:
     """
     Extract text from PDF and ask Gemini a question based on it.
     """
-    model = _get_gemini_model()
-    if model is None:
+    client = _get_gemini_client()
+    if client is None:
         return "Error: AI service not configured (Missing API Key)."
 
     try:
@@ -151,29 +164,119 @@ def chat_with_pdf(pdf_path: str, user_question: str) -> str:
         return f"Error reading PDF: {str(e)}"
 
     try:
-        prompt = f"""
-        You are a helpful assistant for a PDF document.
-        
-        You are given CONTEXT text that was extracted from a PDF. Use it as your primary reference, but you may also use your own general knowledge to:
-        - provide deeper explanations or background information
-        - give brief or detailed summaries
-        - suggest useful external links (official docs, websites, etc.) related to concepts in the PDF
-        
-        When the user asks for a link, answer with a direct https URL that best matches the topic, even if the exact URL is not written in the PDF, as long as it is relevant to the CONTEXT and question.
-        
-        When you add information that is not explicitly in the CONTEXT, present it clearly as explanation, background, or additional details, not as a quote from the PDF.
-        
-        CONTEXT:
-        {text}
-        
-        USER QUESTION:
-        {user_question}
-        
-        Reply in the same language as the question.
-        Use clean Markdown formatting (bold for key terms, bullet points for lists) to make the answer easy to read.
-        """
+        # Debug log
+        print(f"DEBUG: Generating chat response for question: {user_question[:50]}...")
 
-        response = model.generate_content(prompt)
+        prompt = f"""You are a helpful assistant for a PDF document.
+
+You are given CONTEXT text that was extracted from a PDF. Use it as your primary reference, but you may also use your own general knowledge to:
+- provide deeper explanations or background information
+- give brief or detailed summaries
+- suggest useful external links (official docs, websites, etc.) related to concepts in the PDF
+
+When the user asks for a link, answer with a direct https URL that best matches the topic, even if the exact URL is not written in the PDF, as long as it is relevant to the CONTEXT and question.
+
+When you add information that is not explicitly in the CONTEXT, present it clearly as explanation, background, or additional details, not as a quote from the PDF.
+
+CONTEXT:
+{text}
+
+USER QUESTION:
+{user_question}
+
+Reply in the same language as the question.
+Use clean Markdown formatting (bold for key terms, bullet points for lists) to make the answer easy to read."""
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=1000,
+                temperature=0.7
+            )
+        )
+        
+        if not response or not response.text:
+             print("DEBUG: AI returned empty response for chat")
+             return "Error: AI returned an empty response."
+             
+        print(f"DEBUG: Chat response generated successfully. Length: {len(response.text)}")
         return response.text
     except Exception as e:
+        print(f"DEBUG: AI Error in chat_with_pdf: {str(e)}")
+        return f"AI Error: {str(e)}"
+
+
+def summarize_pdf(pdf_path: str) -> str:
+    """
+    Summarize the entire PDF.
+    """
+    client = _get_gemini_client()
+    if client is None:
+        return "Error: AI service not configured (Missing API Key)."
+
+    try:
+        cached_text = _get_cached_pdf_text(pdf_path)
+        if cached_text is not None:
+            text = cached_text
+        else:
+            doc = fitz.open(pdf_path)
+            parts = []
+            for page in doc:
+                parts.append(page.get_text())
+            text = "".join(parts)
+
+            if not text.strip() or len(text.strip()) < 50:
+                try:
+                    ocr_text = pdf_utils.extract_text(pdf_path, mode="ocr")
+                    if ocr_text.strip():
+                        text = ocr_text
+                except Exception as ocr_error:
+                    print(f"WARNING: OCR failed: {ocr_error}")
+
+            if not text.strip():
+                return "Error: This PDF seems to be empty or contains only images (no selectable text), and OCR could not extract any text."
+
+            if len(text) > 100000:
+                text = text[:100000] + "...(truncated)"
+
+            _set_cached_pdf_text(pdf_path, text)
+    except Exception as e:
+        return f"Error reading PDF: {str(e)}"
+
+    try:
+        prompt = f"""Please summarize the following PDF document in a clear, structured way.
+
+Use Markdown for formatting:
+- Use bold for section headings
+- Use bullet points for key points
+- Keep sections concise and informative
+
+CONTEXT FROM PDF:
+{text}"""
+
+        # Debug log
+        print(f"DEBUG: Generating summary for text length {len(text)}...")
+        
+        # Ensure model is initialized
+        if client is None:
+             return "Error: Model initialization failed."
+             
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=1000,
+                temperature=0.7
+            )
+        )
+        
+        if not response or not response.text:
+             print("DEBUG: AI returned empty response")
+             return "Error: AI returned an empty response."
+             
+        print(f"DEBUG: Summary generated successfully. Length: {len(response.text)}")
+        return response.text
+    except Exception as e:
+        print(f"DEBUG: AI Error in summarize_pdf: {str(e)}")
         return f"AI Error: {str(e)}"

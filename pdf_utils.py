@@ -126,22 +126,40 @@ def images_to_pdf(image_paths: List[str], output_path: str) -> None:
         append_images=valid_images[1:]
     )
 
-def merge_pdfs(pdf_paths: List[str], output_path: str) -> None:
+def merge_pdfs(pdf_paths: List[str], output_path: str, passwords: Optional[List[Optional[str]]] = None) -> None:
     """Merge multiple PDF files into one."""
     merger = pypdf.PdfWriter()
-    
-    for path in pdf_paths:
-        merger.append(path)
-        
-    merger.write(output_path)
+
+    if not passwords:
+        passwords = [None] * len(pdf_paths)
+
+    for idx, path in enumerate(pdf_paths):
+        password = passwords[idx]
+        reader = pypdf.PdfReader(path)
+        if reader.is_encrypted:
+            if not password:
+                raise ValueError(f"PDF at index {idx} is password-protected but no password was provided.")
+            result = reader.decrypt(password)
+            if result == pypdf.PasswordType.NOT_DECRYPTED:
+                raise ValueError(f"Wrong password for PDF at index {idx}.")
+        merger.append(reader)
+
+    with open(output_path, "wb") as f:
+        merger.write(f)
     merger.close()
 
-def split_pdf(input_path: str, output_path: str, mode: str = "all", pages: Optional[Union[str, List[int]]] = None) -> str:
+def split_pdf(input_path: str, output_path: str, mode: str = "all", pages: Optional[Union[str, List[int]]] = None, password: Optional[str] = None) -> str:
     """
     Split a PDF file.
     Returns the mimetype of the output (application/zip or application/pdf).
     """
     reader = pypdf.PdfReader(input_path)
+    if reader.is_encrypted:
+        if not password:
+            raise ValueError("PDF is password-protected but no password was provided.")
+        result = reader.decrypt(password)
+        if result == pypdf.PasswordType.NOT_DECRYPTED:
+            raise ValueError("Wrong password for the PDF.")
     total_pages = len(reader.pages)
 
     if mode == 'all':
@@ -198,197 +216,301 @@ def split_pdf(input_path: str, output_path: str, mode: str = "all", pages: Optio
 def _downsample_images(pdf: pikepdf.Pdf, scale_factor: float, quality: int):
     """
     Iterates through all images in the PDF and resizes/compresses them.
-    Handles shared resources to prevent file bloat.
+    Preserves SMask (transparency), skips image masks and unsupported color spaces.
     """
     count = 0
-    seen_images = {} # Map objgen to new stream
+    seen_images = {}  # Map objgen -> new stream (avoid reprocessing shared refs)
 
     for page in pdf.pages:
         if "/Resources" not in page:
             continue
         resources = page.Resources
-        if "/XObject" in resources:
-            xobjects = resources.XObject
-            keys = list(xobjects.keys())
-            
-            for name in keys:
-                raw_image = xobjects[name]
-                if raw_image.Subtype != "/Image":
+        if "/XObject" not in resources:
+            continue
+        xobjects = resources.XObject
+        keys = list(xobjects.keys())
+
+        for name in keys:
+            raw_image = xobjects[name]
+            try:
+                if raw_image.get("/Subtype") != pikepdf.Name("/Image"):
                     continue
-                
-                # Check if we already processed this image (handle shared resources)
-                # raw_image is a pikepdf object. We use its object ID (objgen) as key.
+
+                # Skip image masks (1-bit masks used for text/line art rendering)
+                if raw_image.get("/ImageMask") == pikepdf.Boolean(True):
+                    continue
+
+                # Skip images that have an inline mask — replacing them would break rendering
+                if "/Mask" in raw_image:
+                    continue
+
+                # Skip unsupported / non-trivial color spaces
+                cs = raw_image.get("/ColorSpace")
+                if cs is not None:
+                    cs_name = str(cs) if isinstance(cs, pikepdf.Name) else ""
+                    # CMYK, Indexed, ICCBased, Pattern, Separation → skip
+                    if any(x in cs_name for x in ["/DeviceCMYK", "/Indexed", "/ICCBased", "/Pattern", "/Separation", "/CalRGB", "/CalGray", "/Lab"]):
+                        continue
+
+                # Check shared resource cache
                 if hasattr(raw_image, 'objgen') and raw_image.objgen in seen_images:
                     xobjects[name] = seen_images[raw_image.objgen]
                     continue
-                    
-                try:
-                    pdf_image = pikepdf.PdfImage(raw_image)
-                    pil_image = pdf_image.as_pil_image()
-                    
-                    new_width = int(pil_image.width * scale_factor)
-                    new_height = int(pil_image.height * scale_factor)
-                    
-                    if new_width < 10 or new_height < 10:
-                        continue
-                        
-                    if pil_image.mode == 'L':
-                        color_space_name = "/DeviceGray"
-                    else:
-                        pil_image = pil_image.convert('RGB')
-                        color_space_name = "/DeviceRGB"
-                    
-                    resized_pil = pil_image.resize((new_width, new_height), Image.LANCZOS)
-                    
-                    img_buffer = io.BytesIO()
-                    resized_pil.save(img_buffer, format='JPEG', quality=quality)
-                    img_buffer.seek(0)
-                    
-                    new_stream = pikepdf.Stream(
-                        pdf, 
-                        img_buffer.getvalue(),
-                        Type=pikepdf.Name("/XObject"),
-                        Subtype=pikepdf.Name("/Image"),
-                        Width=new_width,
-                        Height=new_height,
-                        ColorSpace=pikepdf.Name(color_space_name),
-                        BitsPerComponent=8,
-                        Filter=pikepdf.Name("/DCTDecode")
-                    )
-                    
-                    # Update cache if it's an indirect object
-                    if hasattr(raw_image, 'objgen'):
-                        seen_images[raw_image.objgen] = new_stream
 
-                    xobjects[name] = new_stream
-                    count += 1
-                except Exception:
+                pdf_image = pikepdf.PdfImage(raw_image)
+                pil_image = pdf_image.as_pil_image()
+
+                new_width = int(pil_image.width * scale_factor)
+                new_height = int(pil_image.height * scale_factor)
+
+                if new_width < 10 or new_height < 10:
                     continue
+
+                # Determine output color space
+                if pil_image.mode == 'L':
+                    color_space_name = "/DeviceGray"
+                elif pil_image.mode == 'RGBA':
+                    # Drop alpha — write RGB only (alpha was in SMask, handled separately)
+                    pil_image = pil_image.convert('RGB')
+                    color_space_name = "/DeviceRGB"
+                elif pil_image.mode == 'RGB':
+                    color_space_name = "/DeviceRGB"
+                else:
+                    pil_image = pil_image.convert('RGB')
+                    color_space_name = "/DeviceRGB"
+
+                resized_pil = pil_image.resize((new_width, new_height), Image.LANCZOS)
+
+                img_buffer = io.BytesIO()
+                resized_pil.save(img_buffer, format='JPEG', quality=quality)
+                img_buffer.seek(0)
+
+                new_stream = pikepdf.Stream(
+                    pdf,
+                    img_buffer.getvalue(),
+                    Type=pikepdf.Name("/XObject"),
+                    Subtype=pikepdf.Name("/Image"),
+                    Width=new_width,
+                    Height=new_height,
+                    ColorSpace=pikepdf.Name(color_space_name),
+                    BitsPerComponent=8,
+                    Filter=pikepdf.Name("/DCTDecode")
+                )
+
+                # Preserve SMask (soft transparency mask) from original image
+                if "/SMask" in raw_image:
+                    new_stream["/SMask"] = raw_image["/SMask"]
+
+                if hasattr(raw_image, 'objgen'):
+                    seen_images[raw_image.objgen] = new_stream
+
+                xobjects[name] = new_stream
+                count += 1
+
+            except Exception:
+                continue
     return count
 
-def compress_pdf(input_path: str, output_path: str, target_size_mb: Optional[float] = None) -> None:
+
+def _validate_pdf_content(path: str, expected_pages: int) -> bool:
+    """
+    Returns True if the PDF at `path` appears to have non-blank content
+    and the correct number of pages. Used to catch compression artifacts
+    (e.g. Ghostscript producing blank pages for certain structured PDFs).
+    """
+    try:
+        doc = fitz.open(path)
+        if len(doc.pages) != expected_pages:
+            doc.close()
+            return False
+        # Spot-check first and last pages for any renderable content
+        pages_to_check = list({0, len(doc.pages) - 1})  # deduped
+        for idx in pages_to_check:
+            page = doc[idx]
+            # Any of: text, vector drawings, or embedded images
+            if page.get_text().strip():
+                doc.close()
+                return True
+            if page.get_drawings():
+                doc.close()
+                return True
+            if page.get_images():
+                doc.close()
+                return True
+        doc.close()
+        return False  # All checked pages were blank
+    except Exception:
+        return False  # Unreadable = not valid
+
+
+def compress_pdf(input_path: str, output_path: str, target_size_mb: Optional[float] = None, password: Optional[str] = None) -> None:
     """
     Compress a PDF file.
     Reads from input_path, writes to output_path.
+    Supports password-protected PDFs: decrypts first, then compresses.
     """
     get_mb = lambda p: os.path.getsize(p) / (1024 * 1024)
-    
-    original_size = get_mb(input_path)
-    
-    # If target not set, assume we want significant compression, say 50% or generic
+
+    # Fast encryption check: attempt a pikepdf open.
+    # pikepdf is C-based — open/close on a non-encrypted PDF is nearly instant.
+    # Only on PasswordError do we fall into the decrypt path.
+    decrypted_input = input_path
+    _decrypted_tmp = None
+    try:
+        probe = pikepdf.Pdf.open(input_path)
+        probe.close()
+        # Not encrypted — proceed directly
+    except pikepdf.PasswordError:
+        # PDF is encrypted
+        if not password:
+            raise ValueError("PDF is password-protected but no password was provided.")
+        try:
+            src = pikepdf.Pdf.open(input_path, password=password)
+        except pikepdf.PasswordError:
+            raise ValueError("Wrong password for the PDF.")
+        # Write a decrypted copy for the compression pipeline
+        fd, _decrypted_tmp = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        src.save(_decrypted_tmp)
+        src.close()
+        decrypted_input = _decrypted_tmp
+    except Exception:
+        raise
+
+
+    original_size = get_mb(decrypted_input)
+
+    # If target not set, assume we want significant compression
     if target_size_mb is None:
-        target_size_mb = original_size * 0.75 # Default target
+        target_size_mb = original_size * 0.75  # Default target
 
-    # 1. Try Ghostscript first
-    # We use a temp file for GS output to not clobber output_path yet
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as gs_tmp:
-        gs_tmp_path = gs_tmp.name
-    
-    gs_success = compress_pdf_ghostscript(input_path, gs_tmp_path, target_size_mb)
-    
-    current_working_path = input_path
-    if gs_success and os.path.exists(gs_tmp_path):
-        gs_size = get_mb(gs_tmp_path)
-        if gs_size < original_size:
-            current_working_path = gs_tmp_path
-            
-            if gs_size <= target_size_mb:
-                # Success! Move GS result to output
-                shutil.move(gs_tmp_path, output_path)
-                return
+    gs_tmp_path = None
+    try:
+        # ── Stage 1: Ghostscript ──────────────────────────────────────────────
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as gs_tmp:
+            gs_tmp_path = gs_tmp.name
 
-    # 2. Pikepdf Iterative
-    # We work on 'current_working_path' (either original or GS result)
-    # We need to save to output_path.
-    
-    # If we are using the original file, we copy it to output_path first to work on it?
-    # Actually pikepdf can open input and save to output.
-    
-    attempts = [
-        (1.0, 95), (1.0, 90), (1.0, 85), (1.0, 80), 
-        (1.0, 75), (1.0, 70), (0.9, 70), (0.85, 70),
-        (0.8, 70), (0.8, 65), (0.8, 60), (0.75, 60),
-        (0.7, 60), (0.65, 60), (0.6, 60), (0.55, 55),
-        (0.5, 50), (0.45, 50), (0.4, 50), (0.35, 45),
-        (0.3, 40), (0.25, 40)
-    ]
-    
-    current_size = get_mb(current_working_path)
-    start_index = 0
-    ratio = current_size / target_size_mb
-    if ratio > 5.0: start_index = 9
-    elif ratio > 2.0: start_index = 3
-    
-    best_tmp_path = None
-    min_size = current_size
-    
-    for i in range(start_index, len(attempts)):
-        scale, quality = attempts[i]
-        
-        # Open the current best candidate
-        # If we have a best_tmp_path, use that as base? 
-        # No, we should always go back to the 'current_working_path' (GS result or Original) 
-        # to avoid degradation unless we want cumulative?
-        # Typically iterative from source is better to control artifacts.
-        
+        gs_success = compress_pdf_ghostscript(decrypted_input, gs_tmp_path, target_size_mb)
+
+        # Count original pages for validation
         try:
-            pdf = pikepdf.Pdf.open(current_working_path)
-            
-            _downsample_images(pdf, scale, quality)
-            
-            pdf.remove_unreferenced_resources()
-            
-            # Save to a new temp file
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as attempt_tmp:
-                attempt_path = attempt_tmp.name
-                
-            pdf.save(attempt_path, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
-            pdf.close()
-            
-            new_size = get_mb(attempt_path)
-            
-            if new_size < min_size:
-                min_size = new_size
-                if best_tmp_path and os.path.exists(best_tmp_path):
-                    os.unlink(best_tmp_path)
-                best_tmp_path = attempt_path
-                
-                if min_size <= target_size_mb:
-                    break
-            else:
-                os.unlink(attempt_path)
-                
+            orig_doc = fitz.open(decrypted_input)
+            original_page_count = len(orig_doc.pages)
+            orig_doc.close()
         except Exception:
-            pass
+            original_page_count = 0
 
-    # Finalize
-    if best_tmp_path and os.path.exists(best_tmp_path):
-        if os.path.exists(output_path):
-            os.unlink(output_path)
-        shutil.move(best_tmp_path, output_path)
-    elif current_working_path != input_path:
-        # We used GS and it was the best we got
-        shutil.move(current_working_path, output_path)
-    else:
-        # We failed to compress further, just copy original
-        shutil.copy(input_path, output_path)
-        
-    # Cleanup GS temp if it exists and wasn't moved
-    if os.path.exists(gs_tmp_path):
-        try:
-            os.unlink(gs_tmp_path)
-        except:
-            pass
+        current_working_path = decrypted_input
+        if gs_success and os.path.exists(gs_tmp_path):
+            gs_size = get_mb(gs_tmp_path)
+            if gs_size < original_size:
+                # Validate GS output has non-blank content before accepting it
+                # (GS can produce blank pages for structured/government PDFs)
+                if original_page_count == 0 or _validate_pdf_content(gs_tmp_path, original_page_count):
+                    current_working_path = gs_tmp_path
+                    if gs_size <= target_size_mb:
+                        shutil.move(gs_tmp_path, output_path)
+                        gs_tmp_path = None  # already moved, don't delete
+                        return
+                else:
+                    print("WARNING: GS output failed content validation (blank pages). Falling back to pikepdf.")
 
-def extract_text(input_path: str, mode: str = "ocr") -> str:
+        # ── Stage 2: Pikepdf iterative image downsampling ─────────────────────
+        attempts = [
+            (1.0, 95), (1.0, 90), (1.0, 85), (1.0, 80),
+            (1.0, 75), (1.0, 70), (0.9, 70), (0.85, 70),
+            (0.8, 70), (0.8, 65), (0.8, 60), (0.75, 60),
+            (0.7, 60), (0.65, 60), (0.6, 60), (0.55, 55),
+            (0.5, 50), (0.45, 50), (0.4, 50), (0.35, 45),
+            (0.3, 40), (0.25, 40)
+        ]
+
+        current_size = get_mb(current_working_path)
+        start_index = 0
+        ratio = current_size / target_size_mb
+        if ratio > 5.0:
+            start_index = 9
+        elif ratio > 2.0:
+            start_index = 3
+
+        best_tmp_path = None
+        min_size = current_size
+
+        for i in range(start_index, len(attempts)):
+            scale, quality = attempts[i]
+            try:
+                pdf = pikepdf.Pdf.open(current_working_path)
+                _downsample_images(pdf, scale, quality)
+                pdf.remove_unreferenced_resources()
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as attempt_tmp:
+                    attempt_path = attempt_tmp.name
+                pdf.save(attempt_path, compress_streams=True, object_stream_mode=pikepdf.ObjectStreamMode.generate)
+                pdf.close()
+                new_size = get_mb(attempt_path)
+                if new_size < min_size:
+                    min_size = new_size
+                    if best_tmp_path and os.path.exists(best_tmp_path):
+                        os.unlink(best_tmp_path)
+                    best_tmp_path = attempt_path
+                    if min_size <= target_size_mb:
+                        break
+                else:
+                    os.unlink(attempt_path)
+            except Exception:
+                pass
+
+        # ── Finalize: pick best result ────────────────────────────────────────
+        if best_tmp_path and os.path.exists(best_tmp_path):
+            # Validate pikepdf output before accepting
+            if original_page_count == 0 or _validate_pdf_content(best_tmp_path, original_page_count):
+                if os.path.exists(output_path):
+                    os.unlink(output_path)
+                shutil.move(best_tmp_path, output_path)
+            else:
+                # pikepdf output is blank — fall back to GS result or original
+                print("WARNING: pikepdf output failed content validation. Using fallback.")
+                os.unlink(best_tmp_path)
+                best_tmp_path = None
+                if current_working_path != decrypted_input and os.path.exists(current_working_path):
+                    shutil.copy(current_working_path, output_path)
+                else:
+                    shutil.copy(decrypted_input, output_path)
+        elif current_working_path != decrypted_input and os.path.exists(current_working_path):
+            shutil.move(current_working_path, output_path)
+            gs_tmp_path = None  # already moved
+        else:
+            shutil.copy(decrypted_input, output_path)
+
+    finally:
+        # Cleanup GS temp if it wasn't moved to output
+        if gs_tmp_path and os.path.exists(gs_tmp_path):
+            try:
+                os.unlink(gs_tmp_path)
+            except Exception:
+                pass
+        # Cleanup decrypted temp
+        if _decrypted_tmp and os.path.exists(_decrypted_tmp):
+            try:
+                os.unlink(_decrypted_tmp)
+            except Exception:
+                pass
+
+
+def extract_text(input_path: str, mode: str = "ocr", password: Optional[str] = None) -> str:
     """
     Extract text from PDF.
     mode: 'text' (native extraction) or 'ocr' (optical character recognition).
+    Supports password-protected PDFs.
     """
     extracted_text = []
-    
+
     try:
         doc = fitz.open(input_path)
+        if doc.needs_pass:
+            if not password:
+                raise ValueError("PDF is password-protected but no password was provided.")
+            if not doc.authenticate(password):
+                raise ValueError("Wrong password for the PDF.")
         
         for i, page in enumerate(doc):
             if mode == 'ocr':
@@ -459,16 +581,23 @@ def compress_image(input_path: str, output_path: str, target_size_mb: Optional[f
         except Exception:
              shutil.copy(input_path, output_path)
 
-def organize_pdf(input_path: str, output_path: str, pages_config: List[dict]) -> None:
+def organize_pdf(input_path: str, output_path: str, pages_config: List[dict], password: Optional[str] = None) -> None:
     """
     Organize PDF: reorder, rotate, delete, add blank pages.
-    pages_config: List of dicts, e.g., 
+    Supports password-protected PDFs.
+    pages_config: List of dicts, e.g.,
     [
-      {"type": "original", "page_index": 0, "rotation": 90}, 
+      {"type": "original", "page_index": 0, "rotation": 90},
       {"type": "blank"}
     ]
     """
     reader = pypdf.PdfReader(input_path)
+    if reader.is_encrypted:
+        if not password:
+            raise ValueError("PDF is password-protected but no password was provided.")
+        result = reader.decrypt(password)
+        if result == pypdf.PasswordType.NOT_DECRYPTED:
+            raise ValueError("Wrong password for the PDF.")
     writer = pypdf.PdfWriter()
     
     total_pages = len(reader.pages)
@@ -543,6 +672,56 @@ def unlock_pdf(input_path: str, output_path: str, password: str) -> None:
         raise ValueError("Wrong password. Please try again.")
 
 
+def crop_pdf(
+    input_path: str,
+    output_path: str,
+    pages: List[int],
+    crop_box: dict,
+    password: Optional[str] = None,
+) -> None:
+    """
+    Crop selected pages of a PDF by setting their CropBox.
+
+    Args:
+        input_path:  Path to the source PDF.
+        output_path: Path for the output PDF.
+        pages:       0-based page indices to crop. Pass [-1] to crop ALL pages.
+        crop_box:    Dict with fractional values (0.0–1.0) of the MediaBox:
+                     { "left": f, "top": f, "right": f, "bottom": f }
+                     where left/top are the start, right/bottom are the end of
+                     the kept area (not the margin sizes).
+    """
+    doc = fitz.open(input_path)
+    if doc.needs_pass:
+        if not password:
+            raise ValueError("PDF is password-protected but no password was provided.")
+        if not doc.authenticate(password):
+            raise ValueError("Wrong password for the PDF.")
+
+    all_pages = pages == [-1] or pages == []
+
+    for page_num in range(len(doc)):
+        if not all_pages and page_num not in pages:
+            continue
+
+        page = doc[page_num]
+        mb = page.mediabox  # fitz.Rect(x0, y0, x1, y1)
+
+        w = mb.width
+        h = mb.height
+
+        # Convert fractional values → absolute PDF points
+        x0 = mb.x0 + crop_box.get("left", 0.0) * w
+        y0 = mb.y0 + crop_box.get("top", 0.0) * h
+        x1 = mb.x0 + crop_box.get("right", 1.0) * w
+        y1 = mb.y0 + crop_box.get("bottom", 1.0) * h
+
+        page.set_cropbox(fitz.Rect(x0, y0, x1, y1))
+
+    doc.save(output_path)
+    doc.close()
+
+
 def resize_image(input_path: str, output_path: str, width: Optional[int] = None, height: Optional[int] = None, scale_factor: Optional[float] = None) -> None:
     """
     Resize an image. If scale_factor is provided, use that; else use width/height (preserve aspect ratio if only one is provided).
@@ -591,3 +770,163 @@ def resize_image(input_path: str, output_path: str, width: Optional[int] = None,
              img.save(output_path, "JPEG")
         except Exception:
              shutil.copy(input_path, output_path)
+
+
+def add_page_numbers(
+    input_path: str,
+    output_path: str,
+    position: str = "bottom-center",
+    font_size: int = 12,
+    start_number: int = 1,
+    prefix: str = "",
+    suffix: str = "",
+    password: Optional[str] = None,
+) -> None:
+    """
+    Add page numbers to every page of a PDF using PyMuPDF.
+    position: one of top-left, top-center, top-right,
+                         bottom-left, bottom-center, bottom-right
+    """
+    doc = fitz.open(input_path)
+    if doc.needs_pass:
+        if not password:
+            raise ValueError("PDF is password-protected but no password was provided.")
+        if not doc.authenticate(password):
+            raise ValueError("Wrong password for the PDF.")
+
+    margin = 28  # points from edge
+
+    for i, page in enumerate(doc):
+        page_num = i + start_number
+        label = f"{prefix}{page_num}{suffix}"
+        rect = page.rect  # page bounding box
+
+        # Determine x, y based on position
+        pos_lower = position.lower()
+        if "top" in pos_lower:
+            y = rect.y0 + margin
+        else:
+            y = rect.y1 - margin
+
+        if "left" in pos_lower:
+            x = rect.x0 + margin
+            align = fitz.TEXT_ALIGN_LEFT
+        elif "right" in pos_lower:
+            x = rect.x1 - margin
+            align = fitz.TEXT_ALIGN_RIGHT
+        else:
+            x = rect.width / 2
+            align = fitz.TEXT_ALIGN_CENTER
+
+        # Insert text annotation
+        page.insert_text(
+            fitz.Point(x, y),
+            label,
+            fontsize=font_size,
+            color=(0, 0, 0),
+            fontname="helv",
+        )
+
+    doc.save(output_path)
+    doc.close()
+
+
+def repair_pdf(input_path: str, output_path: str, password: Optional[str] = None) -> dict:
+    """
+    Attempt a professional multi-stage repair of a damaged / malformed PDF.
+    Returns a dict with 'method' and 'issues_found' for reporting.
+    """
+    issues = []
+    method_used = "none"
+
+    # ── Stage 1: try pikepdf (handles xref rebuilding, stream errors) ──────────
+    try:
+        open_kwargs = {}
+        if password:
+            open_kwargs["password"] = password
+        pdf = pikepdf.Pdf.open(
+            input_path,
+            suppress_warnings=False,
+            **open_kwargs
+        )
+        pdf.remove_unreferenced_resources()
+        pdf.save(
+            output_path,
+            compress_streams=True,
+            object_stream_mode=pikepdf.ObjectStreamMode.generate,
+            linearize=False,
+        )
+        pdf.close()
+        issues.append("Rebuilt cross-reference table")
+        issues.append("Removed unreferenced resources")
+        method_used = "pikepdf"
+
+        # Validate output is readable
+        test = pikepdf.Pdf.open(output_path)
+        page_count = len(test.pages)
+        test.close()
+        issues.append(f"Verified {page_count} pages readable")
+        return {"method": method_used, "issues_found": issues}
+
+    except Exception as pikepdf_err:
+        issues.append(f"pikepdf partial: {str(pikepdf_err)[:120]}")
+
+    # ── Stage 2: try Ghostscript (deep stream repair + re-distillation) ────────
+    gs_cmd = get_ghostscript_command()
+    if gs_cmd:
+        try:
+            args = [
+                gs_cmd,
+                "-sDEVICE=pdfwrite",
+                "-dCompatibilityLevel=1.4",
+                "-dNOPAUSE",
+                "-dQUIET",
+                "-dBATCH",
+                "-dPDFSETTINGS=/default",
+                f"-sOutputFile={output_path}",
+                input_path,
+            ]
+            subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 100:
+                issues.append("Repaired via Ghostscript re-distillation")
+                method_used = "ghostscript"
+                return {"method": method_used, "issues_found": issues}
+        except Exception as gs_err:
+            issues.append(f"Ghostscript failed: {str(gs_err)[:120]}")
+
+    # ── Stage 3: PyMuPDF salvage (page-by-page extraction) ────────────────────
+    try:
+        src = fitz.open(input_path)
+        if src.needs_pass:
+            if not password:
+                raise ValueError("PDF is password-protected but no password was provided.")
+            if not src.authenticate(password):
+                raise ValueError("Wrong password for the PDF.")
+
+        dest = fitz.open()  # new empty PDF
+        salvaged = 0
+        for page_num in range(len(src)):
+            try:
+                dest.insert_pdf(src, from_page=page_num, to_page=page_num)
+                salvaged += 1
+            except Exception:
+                issues.append(f"Skipped unreadable page {page_num + 1}")
+
+        dest.save(output_path, garbage=4, deflate=True)
+        dest.close()
+        src.close()
+
+        if salvaged == 0:
+            raise ValueError("No pages could be salvaged from the PDF.")
+
+        issues.append(f"Salvaged {salvaged} pages via PyMuPDF")
+        method_used = "pymupdf_salvage"
+        return {"method": method_used, "issues_found": issues}
+
+    except Exception as mupdf_err:
+        issues.append(f"PyMuPDF failed: {str(mupdf_err)[:120]}")
+
+    raise ValueError(
+        "Could not repair the PDF. It may be severely corrupted or encrypted with an unknown cipher.\n"
+        + "\n".join(issues)
+    )

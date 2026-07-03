@@ -17,6 +17,9 @@ _gemini_client: Optional[genai.Client] = None
 _pdf_text_cache: "OrderedDict[str, str]" = OrderedDict()
 _pdf_text_cache_max_entries = 8
 
+# Active model — gemini-2.5-flash-lite has the best free-tier quota
+GEMINI_MODEL = "gemini-2.5-flash-lite"
+
 
 def configure_genai() -> bool:
     global _genai_configured, _gemini_client
@@ -97,6 +100,11 @@ The tools available are:
 7. Security: Add password protection.
 8. Watermark: Add text watermarks.
 9. Chat with PDF: Upload a PDF and ask questions about it.
+10. Unlock PDF: Remove password protection from PDFs.
+11. Rotate PDF: Rotate selected or all pages of a PDF.
+12. Crop PDF: Crop specific pages or all pages.
+13. Page Numbers: Add page numbers at various positions with custom size, start numbers, and text.
+14. Repair PDF: Recover/repair broken, corrupted, or damaged PDFs.
 
 If the user greets you (Hello, Hi, Namaste), greet them back politely in the same language.
 If the user asks how to use a tool, explain it simply.
@@ -107,7 +115,7 @@ IMPORTANT: Reply in the SAME language as the user (English, Hindi, or Hinglish).
 
         full_prompt = f"{system_prompt}\n\nUSER: {message}"
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model=GEMINI_MODEL,
             contents=full_prompt,
             config=types.GenerateContentConfig(
                 max_output_tokens=500,
@@ -188,7 +196,7 @@ Reply in the same language as the question.
 Use clean Markdown formatting (bold for key terms, bullet points for lists) to make the answer easy to read."""
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 max_output_tokens=1000,
@@ -263,7 +271,7 @@ CONTEXT FROM PDF:
              return "Error: Model initialization failed."
              
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 max_output_tokens=1000,
